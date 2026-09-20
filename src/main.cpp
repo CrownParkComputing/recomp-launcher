@@ -4,13 +4,12 @@
 //
 //   recomp-launcher [--smoke <seconds>] [--launch <id>]
 //
-// Home is a game icon rail plus the text rows Play / Settings / Save data /
-// Quit. Settings are per game (FPS cap, FPS overlay, controller mode, pad
-// device, save folder) and persist through settings.hpp. Save data is one
-// global page listing every game's VMU files, with per-game Backup / Delete
-// and a Backup all row; delete asks for confirmation and always leaves a
-// timestamped backup. Play forks the game's own launch.sh with the recomp
-// environment and logs its output; the menu waits for the child.
+// Home is a game icon rail plus the text rows Play / Settings / Quit.
+// Settings are per game (FPS cap, FPS overlay, renderer, controller mode,
+// pad device) and persist through settings.hpp; the same page imports a
+// game's content from a .gdi dump and clears it again. Play forks the
+// game's own launch.sh with the recomp environment and logs its output;
+// the menu waits for the child.
 #include "raylib.h"
 #include "settings.hpp"
 #include <sys/wait.h>
@@ -159,7 +158,9 @@ static void launch(Game &g,const fs::path &home,const fs::path &data,const fs::p
             std::string key=*e;key=key.substr(0,key.find('='));
             if(key.rfind("MSR_",0)==0||key.rfind("PS_",0)==0||key.rfind("RECOMP_",0)==0){unsetenv(key.c_str());e=environ;}else ++e;
         }
-        setenv("RECOMP_RENDERER","raylib",1);setenv("POWERSTONE_RENDERER","raylib",1);
+        const char *rend=g.settings.renderer==1?"vulkan":"raylib";
+        setenv("RECOMP_RENDERER",rend,1);setenv("POWERSTONE_RENDERER",rend,1);
+        setenv("MSR_VULKAN",g.settings.renderer==1?"1":"0",1);
         setenv("MSR_VMU",vmu.c_str(),1);setenv("MSR_FPS",std::to_string(g.settings.fps).c_str(),1);
         setenv("RECOMP_PAD",mode_env(g.settings.mode),1);
         setenv("RECOMP_GAMEPAD",g.settings.pad.c_str(),1);setenv("RECOMP_SHOW_FPS",g.settings.show?"1":"0",1);
@@ -190,60 +191,13 @@ static std::string cycle_pad(const std::string &cur,int dir){
     return pads[(at+(dir>0?1:pads.size()-1))%pads.size()];
 }
 
-/* ---- save data: backup / delete, symlink-safe ---------------------------- */
-static std::string timestamp_now(){
-    std::time_t t=std::time(nullptr);
-    char buf[32];
-    std::strftime(buf,sizeof buf,"%Y%m%d-%H%M%S",std::localtime(&t));
-    return buf;
-}
-
-// The VMU files a game has in its save folder (vmu_a1.bin and friends).
-static std::vector<fs::path> save_files(const Game &g){
-    std::vector<fs::path> out;
-    std::error_code ec;
-    for(const auto &e:fs::directory_iterator(g.settings.saves,ec)){
-        const auto name=e.path().filename().string();
-        if(name.size()>4&&name.compare(name.size()-4,4,".bin")==0)
-            out.push_back(e.path());
-        ec.clear();
-    }
-    std::sort(out.begin(),out.end());
-    return out;
-}
-
+/* ---- save data: symlink-safe helpers ------------------------------------- */
 // Refuse a path that is, or passes through, a symbolic link.
 static void refuse_symlinks(const fs::path &p,const fs::path &root){
     for(fs::path q=p;!q.empty();q=q.parent_path()){
         if(fs::is_symlink(q))throw std::runtime_error("Save path contains a symbolic link");
         if(q==root||!q.has_parent_path())break;
     }
-}
-
-// Every backup completes before anything is removed.
-static fs::path backup_all(const Game &g,const fs::path &data,const std::vector<fs::path> &files){
-    const fs::path root=g.settings.saves;
-    const fs::path backup=data/"save-backups"/g.id/timestamp_now();
-    for(const auto &src:files){
-        if(!fs::exists(src))continue;
-        refuse_symlinks(src,root);
-        const fs::path dest=backup/src.filename();
-        fs::create_directories(dest.parent_path());
-        fs::copy_file(src,dest);
-    }
-    return backup;
-}
-
-static std::string modtime_text(const fs::path &p){
-    std::error_code ec;
-    const auto ft=fs::last_write_time(p,ec);
-    if(ec)return "unknown";
-    const auto st=std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-        ft-fs::file_time_type::clock::now()+std::chrono::system_clock::now());
-    const std::time_t t=std::chrono::system_clock::to_time_t(st);
-    char buf[40];
-    std::strftime(buf,sizeof buf,"%Y-%m-%d %H:%M",std::localtime(&t));
-    return buf;
 }
 
 // The newest game log in the launcher's log dir, for the details block.
@@ -320,7 +274,7 @@ static void row_value(Rectangle r,const std::string &label,const std::string &va
     ui_text(v,(int)(r.x+r.width-18-ui_measure(v,24)),(int)r.y+((int)r.height-24)/2,24,text);
 }
 
-enum class Screen { Home, Settings, Saves };
+enum class Screen { Home, Settings };
 
 int main(int argc,char **argv){
     try {
@@ -401,27 +355,21 @@ int main(int argc,char **argv){
     int selected=0;             // active game
     Screen screen=Screen::Home;
     Nav nav;
-    double blink=0.0;
-    int home_sel=0,settings_sel=0,saves_sel=0;
-    bool editing=false;         // save-folder text field owns the keyboard
-    bool confirming_delete=false;
-    int confirm_game=0;
+    int home_sel=0,settings_sel=0;
     // Rail hover state, one frame stale by design (see the draw below).
     int rail_hover=-1;
     float rail_scroll_x=0.0f;
     bool rail_scroll_ready=false;
-    // Zenity browse: async child with a pipe, like the old launcher.
-    pid_t browse_pid=0;int browse_fd=-1,browse_game=0;std::string browse_text;
-    // GDI import: same async pattern for the .gdi picker, then a forked
+    // GDI import: async zenity .gdi picker, then a forked
     // tools/import_gdi.py child that fills the game's disc/ folder.
     pid_t gdi_pid=0;int gdi_fd=-1,gdi_game=0;std::string gdi_text;
     pid_t import_pid=0;int import_game=0;std::string import_log;
     bool confirming_clear=false;
     int clear_game=0;
 
-    const char *const kHomeItems[]={"Play","Settings","Save data","Quit"};
-    const int kHomeCount=4;
-    const int kSettingsCount=9; // fps, overlay, mode, pad, folder, browse, save, import, clear
+    const char *const kHomeItems[]={"Play","Settings","Quit"};
+    const int kHomeCount=3;
+    const int kSettingsCount=8; // fps, overlay, renderer, mode, pad, import, clear, save
     const float kRowW=560.0f;   // settings rows; the details block sits right of them
 
     if(auto_game>=0){
@@ -432,8 +380,8 @@ int main(int argc,char **argv){
 
     auto switch_game=[&](int idx){
         if(idx<0||idx>=(int)games.size())return;
-        selected=idx;home_sel=0;settings_sel=0;saves_sel=0;
-        editing=false;confirming_delete=false;confirming_clear=false;
+        selected=idx;home_sel=0;settings_sel=0;
+        confirming_clear=false;
     };
     auto any_running=[&]{
         for(const auto &gg:games)if(gg.pid)return true;
@@ -486,32 +434,10 @@ int main(int argc,char **argv){
         switch(row){
             case 0: s.fps=cycle_fps(s.fps,dir);break;
             case 1: s.show=!s.show;break;
-            case 2: s.mode=s.mode==2?0:2;break;
-            case 3: if(s.mode==0)s.pad=cycle_pad(s.pad,dir);break;
-            case 4: editing=true;break;
-            case 5: { // Browse, via zenity (async, non-blocking)
-                if(browse_fd>=0)break;
-                int pipes[2];
-                if(pipe(pipes)==0){
-                    browse_pid=fork();
-                    if(browse_pid==0){
-                        dup2(pipes[1],STDOUT_FILENO);close(pipes[0]);close(pipes[1]);
-                        execlp("zenity","zenity","--file-selection","--directory","--title=Choose save folder",(char*)nullptr);
-                        _exit(127);
-                    }
-                    close(pipes[1]);
-                    if(browse_pid>0){browse_fd=pipes[0];fcntl(browse_fd,F_SETFL,O_NONBLOCK);browse_text.clear();browse_game=selected;}
-                    else close(pipes[0]);
-                }
-                break;
-            }
-            case 6:
-                try{
-                    save_settings(cfg/(std::string(g.id)+".conf"),s);
-                    set_status("Settings saved for "+std::string(g.title));
-                }catch(const std::exception &e){set_status(e.what(),true);}
-                break;
-            case 7: { // Import GDI image, via zenity (async, non-blocking)
+            case 2: s.renderer=s.renderer?0:1;break;
+            case 3: s.mode=s.mode==2?0:2;break;
+            case 4: if(s.mode==0)s.pad=cycle_pad(s.pad,dir);break;
+            case 5: { // Import GDI image, via zenity (async, non-blocking)
                 if(gdi_fd>=0||import_pid||g.pid)break;
                 int pipes[2];
                 if(pipe(pipes)==0){
@@ -529,16 +455,21 @@ int main(int argc,char **argv){
                 }
                 break;
             }
-            case 8: // Clear imported data (asks for confirmation)
+            case 6: // Clear imported data (asks for confirmation)
                 if(g.pid||import_pid||gdi_fd>=0)break;
                 confirming_clear=true;clear_game=selected;
+                break;
+            case 7:
+                try{
+                    save_settings(cfg/(std::string(g.id)+".conf"),s);
+                    set_status("Settings saved for "+std::string(g.title));
+                }catch(const std::exception &e){set_status(e.what(),true);}
                 break;
         }
     };
 
     while(!WindowShouldClose()){
         if(smoke>0&&GetTime()>smoke)break;
-        blink+=GetFrameTime();
         poll_input(nav);
         const int w=GetScreenWidth(),h=GetScreenHeight();
         Game &g=games[selected];
@@ -551,18 +482,6 @@ int main(int argc,char **argv){
                 gg.pid=0;
                 set_status(std::string(gg.title)+(WIFEXITED(code)&&WEXITSTATUS(code)==0
                     ?" closed.":" exited; see game log: "+gg.log));
-            }
-        }
-        // Zenity finished (or failed): fold its answer into the save folder.
-        if(browse_fd>=0){
-            char buf[1024];ssize_t n;
-            while((n=read(browse_fd,buf,sizeof buf))>0)browse_text.append(buf,n);
-            if(n==0){
-                int code;waitpid(browse_pid,&code,0);close(browse_fd);browse_fd=-1;
-                if(WIFEXITED(code)&&WEXITSTATUS(code)==0){
-                    while(!browse_text.empty()&&(browse_text.back()=='\n'||browse_text.back()=='\r'))browse_text.pop_back();
-                    if(!browse_text.empty())games[browse_game].settings.saves=browse_text;
-                }
             }
         }
         // GDI picker finished: kick off the import child for that game.
@@ -594,9 +513,9 @@ int main(int argc,char **argv){
             }
         }
 
-        // LB/RB switches the active game from any screen (not mid-confirm or
-        // mid-edit: the field owns the keys then).
-        if(!confirming_delete&&!confirming_clear&&!editing&&nav.lb!=nav.rb)
+        // LB/RB switches the active game from any screen (not mid-confirm:
+        // the dialog owns the keys then).
+        if(!confirming_clear&&nav.lb!=nav.rb)
             switch_game((selected+(nav.rb?1:(int)games.size()-1))%(int)games.size());
 
         if(screen==Screen::Home){
@@ -615,8 +534,7 @@ int main(int argc,char **argv){
                 switch(home_sel){
                     case 0: try_play();break;
                     case 1: screen=Screen::Settings;settings_sel=0;break;
-                    case 2: screen=Screen::Saves;saves_sel=0;break;
-                    case 3: goto done;
+                    case 2: goto done;
                 }
             }
         }else if(screen==Screen::Settings){
@@ -641,73 +559,12 @@ int main(int argc,char **argv){
                     confirming_clear=false;
                 }
                 nav.consume();
-            }else if(editing){
-                int c;
-                while((c=GetCharPressed()))if(c>=32&&c<127)s.saves+=(char)c;
-                if(IsKeyPressed(KEY_BACKSPACE)||IsKeyPressedRepeat(KEY_BACKSPACE))
-                    if(!s.saves.empty())s.saves.pop_back();
-                if(IsKeyDown(KEY_LEFT_CONTROL)&&IsKeyPressed(KEY_V)){
-                    const char *p=GetClipboardText();if(p)s.saves=p;
-                }
-                if(IsKeyPressed(KEY_ENTER)||IsKeyPressed(KEY_ESCAPE))editing=false;
             }else{
                 if(nav.up)settings_sel=(settings_sel+kSettingsCount-1)%kSettingsCount;
                 if(nav.down)settings_sel=(settings_sel+1)%kSettingsCount;
                 const int cycle=nav.right?1:(nav.left?-1:0);
                 if(cycle)cycle_settings(settings_sel,cycle);
                 if(nav.a)cycle_settings(settings_sel,1);
-                if(nav.b)screen=Screen::Home;
-            }
-        }else if(screen==Screen::Saves){
-            // One global page: per-game Backup / Delete rows, then Backup all
-            // and Back. The row order matches the draw below.
-            const int kSaveRows=2*(int)games.size()+2;
-            if(confirming_delete){
-                if(nav.b||nav.y)confirming_delete=false;
-                else if(nav.a){
-                    Game &cg=games[confirm_game];
-                    try{
-                        const auto files=save_files(cg);
-                        if(files.empty())throw std::runtime_error("No saves in this folder.");
-                        const fs::path backup=backup_all(cg,data,files);
-                        for(const auto &p:files)fs::remove(p);
-                        set_status("Deleted from game; backup: "+backup.string());
-                    }catch(const std::exception &e){set_status(std::string("Save operation failed: ")+e.what(),true);}
-                    confirming_delete=false;
-                }
-                nav.consume();
-            }else{
-                if(nav.up)saves_sel=(saves_sel+kSaveRows-1)%kSaveRows;
-                if(nav.down)saves_sel=(saves_sel+1)%kSaveRows;
-                if(nav.a){
-                    const int row=saves_sel;
-                    if(row<2*(int)games.size()){
-                        const int gi=row/2;const bool del=row%2==1;
-                        Game &sg=games[gi];
-                        if(del){
-                            if(!save_files(sg).empty()){confirming_delete=true;confirm_game=gi;}
-                            else set_status("No saves in this folder.");
-                        }else{
-                            try{
-                                const auto files=save_files(sg);
-                                if(files.empty())throw std::runtime_error("No saves in this folder.");
-                                set_status("Backup: "+backup_all(sg,data,files).string());
-                            }catch(const std::exception &e){set_status(std::string("Save operation failed: ")+e.what(),true);}
-                        }
-                    }else if(row==2*(int)games.size()){ // Backup all
-                        try{
-                            int backed=0;
-                            for(const auto &sg:games){
-                                const auto files=save_files(sg);
-                                if(files.empty())continue;
-                                backup_all(sg,data,files);++backed;
-                            }
-                            if(!backed)throw std::runtime_error("No saves in the library yet.");
-                            set_status("Backed up saves for "+std::to_string(backed)+" game(s) to "+
-                                       (data/"save-backups").string());
-                        }catch(const std::exception &e){set_status(std::string("Save operation failed: ")+e.what(),true);}
-                    }else screen=Screen::Home;
-                }
                 if(nav.b)screen=Screen::Home;
             }
         }
@@ -783,8 +640,7 @@ int main(int argc,char **argv){
                 if(row_draw(row,label,sel,dim)){
                     if(i==0)try_play();
                     else if(i==1){screen=Screen::Settings;settings_sel=0;}
-                    else if(i==2){screen=Screen::Saves;saves_sel=0;}
-                    else if(i==3){EndDrawing();goto done;}
+                    else if(i==2){EndDrawing();goto done;}
                 }
             }
 
@@ -799,10 +655,10 @@ int main(int argc,char **argv){
             ui_text(g.tag,info_x+(tiles[selected].ok()?82:0),list_y+37,17,col_muted);
             ui_text(g.pid?"Running now":(has_content?"Ready to play":"No game data imported - import a .gdi in Settings"),
                     info_x,list_y+84,18,g.pid?col_ok:(has_content?col_warn:col_err));
-            ui_text("FPS cap: "+std::to_string(s.fps)+"   overlay: "+(s.show?"on":"off"),
+            ui_text("FPS cap: "+std::to_string(s.fps)+"   overlay: "+(s.show?"on":"off")+
+                    "   renderer: "+(s.renderer?"Vulkan":"OpenGL"),
                     info_x,list_y+116,16,col_muted);
             ui_text(std::string("Controller: ")+mode_label(s.mode),info_x,list_y+140,16,col_muted);
-            ui_text("Saves: "+fit_left(s.saves,15,(float)(w-info_x-margin)),info_x,list_y+164,15,col_hint);
 
             ui_text(status,margin,h-72,18,status_err?col_err:col_ok);
             ui_text("F3 toggles the in-game FPS counter. Close the game with Escape.",
@@ -816,34 +672,21 @@ int main(int argc,char **argv){
             const std::string pad_name=s.pad.empty()
                 ?"Automatic: "+(real_pads.empty()?"no mapped pad found":real_pads.front())
                 :s.pad;
-            const std::string labels[]={"Frame-rate limit","FPS overlay","Controller",
-                                        "External pad device","Save folder","Browse...","Save settings",
-                                        "Import GDI image...","Clear imported data"};
-            std::string folder=fit_left(s.saves,20,kRowW-240);
+            const std::string labels[]={"Frame-rate limit","FPS overlay","Renderer","Controller",
+                                        "External pad device","Import GDI image...","Clear imported data","Save settings"};
             const std::string values[]={std::to_string(s.fps)+" FPS",s.show?"On":"Off",
-                                        mode_label(s.mode),pad_name,folder,"","","",""};
+                                        s.renderer?"Vulkan (SDL3)":"OpenGL (raylib)",
+                                        mode_label(s.mode),pad_name,"","",""};
             const int item_h=52;
             const int list_y=margin+100;
             for(int i=0;i<kSettingsCount;++i){
                 const Rectangle row{(float)margin,(float)(list_y+i*item_h),kRowW,(float)(item_h-10)};
                 const bool sel=i==settings_sel;
-                const bool dim=(i==3&&s.mode!=0)||
-                    ((i==7||i==8)&&(g.pid||import_pid||gdi_fd>=0));
-                if(i==4){
-                    row_draw(row,labels[i],sel);
-                    const Rectangle field{row.x+220,row.y+6,row.width-240,row.height-12};
-                    DrawRectangleRounded(field,0.1f,4,editing&&sel?Color{45,62,80,255}:col_bg);
-                    BeginScissorMode((int)field.x+8,(int)field.y,(int)field.width-16,(int)field.height);
-                    ui_text(values[i],(int)field.x+8,(int)field.y+((int)field.height-20)/2,20,RAYWHITE);
-                    EndScissorMode();
-                    if(editing&&sel&&((int)(blink*2)&1)){
-                        const float cx=field.x+8+ui_measure(values[i],20)+2;
-                        DrawRectangle((int)cx,(int)field.y+8,2,(int)field.height-16,RAYWHITE);
-                    }
-                }else if(i>=5){
+                const bool dim=(i==4&&s.mode!=0)||
+                    ((i==5||i==6)&&(g.pid||import_pid||gdi_fd>=0));
+                if(i>=5){
                     row_draw(row,labels[i],sel,dim);
-                    const char *hint=i==5?"A pick a folder":i==6?"A save":
-                        i==7?"A pick a .gdi dump":"A clear (asks first)";
+                    const char *hint=i==5?"A pick a .gdi dump":i==6?"A clear (asks first)":"A save";
                     if(sel&&!dim){
                         const std::string h=hint;
                         ui_text(h,(int)(row.x+row.width-14-ui_measure(h,14)),(int)row.y+16,14,col_hint);
@@ -862,14 +705,11 @@ int main(int argc,char **argv){
             ui_text(s.mode==2?"Keyboard in game: Space/Z A, X B, C X, V Y, Enter Start, arrows D-pad, WASD stick, Q/E triggers.":
                     TextFormat("%zu real pad(s) mapped. Empty device means automatic.",real_pads.size()),
                     margin,note_y+26,16,col_muted);
-            ui_text("VMU card: vmu_a1.bin. Existing saves are copied only if missing.",
-                    margin,note_y+52,15,col_hint);
 
             // Recomp details for the selected game, right of the rows.
             const int det_x=margin+(int)kRowW+120;
             const float det_w=(float)(w-margin-det_x);
             const fs::path root=home/g.dir;
-            const fs::path vmu=fs::path(s.saves)/"vmu_a1.bin";
             std::error_code ec;
             int dy=list_y;
             ui_text("RECOMP DETAILS",det_x,dy,17,col_teal);dy+=30;
@@ -889,114 +729,15 @@ int main(int argc,char **argv){
                    fs::exists(root/g.host)?col_ok:col_err);
             detail("Disc image:",fs::exists(root/"disc/1ST_READ.BIN",ec)?"disc/1ST_READ.BIN (found)":"disc/1ST_READ.BIN (missing)",
                    fs::exists(root/"disc/1ST_READ.BIN")?col_ok:col_warn);
-            detail("Renderer:","raylib / OpenGL",col_muted);
-            if(fs::exists(vmu,ec)){
-                const auto bytes=fs::file_size(vmu,ec);
-                detail("VMU:",vmu.string()+(ec?"":TextFormat(" (%zu KiB)",(size_t)bytes/1024)),col_muted);
-            }else detail("VMU:",vmu.string()+" (not created yet)",col_muted);
+            detail("Renderer:",s.renderer?"SDL3 / Vulkan":"raylib / OpenGL",col_muted);
             detail("Config:",(cfg/(std::string(g.id)+".conf")).string(),col_muted);
             const std::string log=latest_log(data,g.id);
             detail("Latest log:",log.empty()?"none yet":log,col_muted);
 
             ui_text(status,margin,h-72,18,status_err?col_err:col_ok);
-            ui_text("Left/Right change   A edit   B back",margin,h-28,15,col_hint);
-        }else if(screen==Screen::Saves){
-            ui_text("SAVE DATA",margin,margin,36,RAYWHITE);
-            ui_text("VMU files for every game in the library",margin,margin+44,16,col_muted);
-
-            const int item_h=44;
-            int y=margin+90;
-            int row_idx=0; // selectable row counter, same order as the input code
-            for(int i=0;i<(int)games.size();++i){
-                Game &sg=games[i];
-                ui_text(sg.title,margin,y,22,col_teal);
-                ui_text(sg.tag,margin+(int)ui_measure(sg.title,22)+14,y+5,15,col_hint);
-                y+=32;
-                ui_text("Folder: "+fit_left(sg.settings.saves,15,(float)(w-2*margin-90)),margin,y,15,col_hint);
-                y+=24;
-                const auto files=save_files(sg);
-                if(files.empty()){
-                    ui_text("No VMU files yet - they appear after the game saves.",
-                            margin,y,17,Color{170,180,195,255});
-                    y+=28;
-                }else{
-                    for(int k=0;k<(int)files.size()&&k<3;++k){
-                        std::error_code ec;
-                        const auto bytes=fs::file_size(files[k],ec);
-                        ui_text(files[k].filename().string(),margin,y,17,RAYWHITE);
-                        ui_text(ec?"?":std::string(TextFormat("%zu KiB",(size_t)bytes/1024))+"   modified "+modtime_text(files[k]),
-                                margin+240,y+1,15,col_muted);
-                        y+=26;
-                    }
-                    if(files.size()>3){
-                        ui_text("...and "+std::to_string(files.size()-3)+" more",margin,y,15,col_hint);
-                        y+=24;
-                    }
-                    y+=4;
-                }
-                const bool have=!files.empty();
-                const char *actions[]={"Backup","Delete"};
-                for(int a=0;a<2;++a){
-                    const Rectangle row{(float)margin,(float)y,420.0f,(float)(item_h-8)};
-                    const bool sel=row_idx==saves_sel;
-                    const std::string label=std::string(actions[a])+" "+sg.title;
-                    const bool dim=(a==1&&!have);
-                    if(row_draw(row,label,sel,dim)){
-                        if(a==0){
-                            try{
-                                if(files.empty())throw std::runtime_error("No saves in this folder.");
-                                set_status("Backup: "+backup_all(sg,data,files).string());
-                            }catch(const std::exception &e){set_status(std::string("Save operation failed: ")+e.what(),true);}
-                        }else{confirming_delete=true;confirm_game=i;}
-                    }
-                    ++row_idx;
-                    y+=item_h;
-                }
-                y+=14;
-            }
-            // Backup all / Back.
-            const char *tail[]={"Backup all saves","Back"};
-            for(int t=0;t<2;++t){
-                const Rectangle row{(float)margin,(float)y,420.0f,(float)(item_h-8)};
-                const bool sel=row_idx==saves_sel;
-                if(row_draw(row,tail[t],sel)){
-                    if(t==0){
-                        try{
-                            int backed=0;
-                            for(const auto &sg:games){
-                                const auto files=save_files(sg);
-                                if(files.empty())continue;
-                                backup_all(sg,data,files);++backed;
-                            }
-                            if(!backed)throw std::runtime_error("No saves in the library yet.");
-                            set_status("Backed up saves for "+std::to_string(backed)+" game(s) to "+
-                                       (data/"save-backups").string());
-                        }catch(const std::exception &e){set_status(std::string("Save operation failed: ")+e.what(),true);}
-                    }else screen=Screen::Home;
-                }
-                ++row_idx;
-                y+=item_h;
-            }
-
-            ui_text("Backups go to "+(data/"save-backups").string()+"/<game>/<timestamp>/",
-                    margin,h-72,15,col_hint);
-            ui_text(status,margin,h-46,16,status_err?col_err:col_ok);
-            ui_text("A run action   B back (delete asks first, a backup is kept)",
-                    margin,h-28,15,col_hint);
+            ui_text("Left/Right change   A select   B back",margin,h-28,15,col_hint);
         }
 
-        // Delete confirmation, over everything.
-        if(confirming_delete){
-            const Game &cg=games[confirm_game];
-            const auto files=save_files(cg);
-            DrawRectangle(0,0,w,h,Color{0,0,0,220});
-            ui_text("Delete the saves for "+std::string(cg.title)+"?",margin,h/2-50,28,RAYWHITE);
-            for(int i=0;i<(int)files.size()&&i<4;++i)
-                ui_text(files[i].filename().string(),margin,h/2-10+i*24,20,RAYWHITE);
-            ui_text("A / Enter: confirm   B / Escape: cancel. A backup is kept.",
-                    margin,h/2+35+std::min<int>(4,(int)files.size())*24,20,
-                    Color{200,205,212,255});
-        }
         // Clear-data confirmation, over everything.
         if(confirming_clear){
             const Game &cg=games[clear_game];

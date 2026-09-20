@@ -13,16 +13,15 @@ itself is one small C++17/raylib binary.
 
 - Dashboard-style game rail with cover art (or letter tiles), pad, mouse
   and keyboard navigation.
-- Per-game settings: FPS cap, FPS overlay, controller mode, pad device,
-  save folder. Persisted under `~/.config/recomp-launcher/`.
+- Per-game settings: FPS cap, FPS overlay, renderer (OpenGL via raylib or
+  Vulkan via SDL3), controller mode, pad device. Persisted under
+  `~/.config/recomp-launcher/`.
 - **GDI import**: point it at a Redump-style `.gdi` dump of a game you
   own — still inside its `.zip` if that's how you keep it — and it
   extracts the GD-ROM filesystem into the game's `disc/` folder, plus the
   `gdmap.txt`/`ISO_META.BIN` sector map the ports serve GD-ROM reads
   from. No disc image is needed afterwards.
 - **Clear imported data** per game, so a fresh dump can be re-imported.
-- Save data page: per-game VMU backup/delete (deletes always keep a
-  timestamped backup first) and backup-all.
 - Play forks the game's own `launch.sh` with the recomp environment and
   logs to `~/.local/share/recomp-launcher/logs/`.
 

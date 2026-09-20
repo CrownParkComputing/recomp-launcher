@@ -17,14 +17,24 @@ int main(){
 
     // Save/load round trip, quoted strings included.
     Settings s;
-    s.fps=120;s.mode=2;s.show=0;
+    s.fps=120;s.mode=2;s.show=0;s.renderer=1;
     s.saves="/tmp/recomp-settings-test/my saves";
     s.pad="Microsoft Xbox Series S|X Controller";
     const fs::path conf=cfg/"powerstone.conf";
     save_settings(conf,s);
     Settings t=load_settings(conf,Settings{});
-    assert(t.fps==120&&t.mode==2&&t.show==0);
+    assert(t.fps==120&&t.mode==2&&t.show==0&&t.renderer==1);
     assert(t.saves==s.saves&&t.pad==s.pad);
+
+    // Pre-renderer conf files (5 fields) still load; renderer defaults.
+    {std::ofstream f(conf);f<<"60 0 1 \"/tmp/recomp-settings-test/my saves\" \"\"  \n";}
+    Settings l=load_settings(conf,Settings{});
+    assert(l.fps==60&&l.renderer==0);
+
+    // An out-of-range stored renderer falls back, not crashes.
+    {std::ofstream f(conf);f<<"60 0 1 \"/tmp/recomp-settings-test/my saves\" \"\" 7\n";}
+    l=load_settings(conf,Settings{});
+    assert(l.renderer==0);
 
     // Missing file returns the defaults handed in.
     Settings d=load_settings(cfg/"not-there.conf",s);
