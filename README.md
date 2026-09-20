@@ -12,26 +12,34 @@ itself is one small C++17/raylib binary.
 ## Features
 
 - **Four-screen library**: `Home` (Play / Game files / Settings / About /
-  Quit), `Files` (Import GDI image… / Clear imported data / Back),
-  `Settings`, and `About` (per-game 100% native details).
+  Quit), `Files` (per-game import status for every game on the rail,
+  with Import / Clear / Back actions), `Settings`, and `About` (per-game
+  100% native details).
+- The rail is built dynamically from the candidate games; any whose
+  `launch.sh` is missing on disk is dropped (no "Game launcher not found"
+  surprise when you press Play). Cover art loads from
+  `recomp-launcher/assets/<id>.png`, then `icon.png`, then any `.png` in
+  the game dir; missing art falls back to a letter tile so the rail has
+  no holes.
 - Dashboard-style game rail with cover art (or letter tiles), pad, mouse
   and keyboard navigation; LB/RB and mouse wheel switch the active game on
   the Home, Files and About screens.
 - **Global settings**: FPS cap, FPS overlay, renderer (OpenGL via raylib
   or Vulkan via SDL3), controller mode and pad device are shared by every
   game in the rail — one launcher.conf under
-  `~/.config/recomp-launcher/`. Every change auto-saves.
-- **GDI import**: point the Files screen at a Redump-style `.gdi` dump of
-  a game you own — still inside its `.zip` if that's how you keep it —
-  and it extracts the GD-ROM filesystem into the game's `disc/` folder,
-  plus the `gdmap.txt`/`ISO_META.BIN` sector map the ports serve GD-ROM
-  reads from. No disc image is needed afterwards. The status line on every
-  screen reports "Importing…" while the import is running.
+  `~/.config/recomp-launcher/`. Every change auto-saves. Each game caps
+  the cycle at its `max_fps` so MSR can't be pushed past its native 30.
+- **Per-game import queue**: pick a `.gdi` for any game from the Files
+  screen, then navigate to another game and pick its `.gdi` while the
+  first import is still on disk; the launcher runs one import per game
+  in parallel. The status line on every screen reports "Importing…" while
+  the active game's import is running.
 - **Clear imported data** per game (Files → Clear imported data), so a
   fresh dump can be re-imported. Play refuses to start a game with no
   content imported.
 - Play forks the game's own `launch.sh` with the recomp environment and
-  logs to `~/.local/share/recomp-launcher/logs/`.
+  logs to `~/.local/share/recomp-launcher/logs/`. The MSR host gets
+  `TZ=UTC` so the in-game clock isn't dragged by the host's zone.
 
 ## Building
 
@@ -58,9 +66,10 @@ Games live in sibling directories of your home folder, one per port:
 ~/msr-native/
 ```
 
-The launcher table (id, title, directory, host binary, how-the-port-runs
-lines for the About block) is at the top of `main()` in `src/main.cpp`
-— add a row per port. `src/recomp_input.h` is the shared
+The candidate table (id, title, directory, host binary, max_fps, how-it-
+runs lines for the About block) is at the top of `main()` in
+`src/main.cpp` — add a row per port. A row is dropped from the rail if
+its `launch.sh` is missing. `src/recomp_input.h` is the shared
 input-conventions header the game hosts use.
 
 ## Installing a game's content from a .gdi

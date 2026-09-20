@@ -130,6 +130,7 @@ private:
 struct Game {
     const char *id,*title,*tag,*dir,*host;
     const char *how1,*how2; // how the port runs, drawn in the About block
+    int max_fps=120;        // gs.fps is clamped to this at launch time
     pid_t pid=0;
     std::string log;
 };
@@ -141,11 +142,15 @@ static const char *mode_label(int mode){return mode==2?"Keyboard":"External pad"
 static const char *mode_env(int mode){return mode==2?"keyboard":"external";}
 static int fixed_mode(int mode){return mode==2?2:0;}
 
-// FPS caps offered on the Settings row.
-static int cycle_fps(int fps,int dir){
+// FPS caps offered on the Settings row. Clamped to the active game's
+// max_fps so MSR's 30Hz native cap can't be overridden by a global 120.
+static int cycle_fps(int fps,int dir,int max_fps){
     const int rates[]={30,60,120};
-    int at=1;for(int i=0;i<3;i++)if(fps==rates[i])at=i;
-    return rates[(at+dir+3)%3];
+    int valid[3],nv=0;
+    for(int i=0;i<3;i++)if(rates[i]<=max_fps)valid[nv++]=rates[i];
+    if(nv==0)return fps; // no legal option - leave as-is
+    int at=0;for(int i=0;i<nv;i++)if(fps==valid[i])at=i;
+    return valid[(at+dir+nv)%nv];
 }
 
 /* ---- input: one-frame edges from every pad plus the keyboard ------------ */
@@ -261,18 +266,20 @@ struct State {
     Screen screen=Screen::Home;
     Nav nav{};
     int home_sel=0, settings_sel=0, files_sel=0;
+    int files_game=0; // which game the Files-screen actions target
     // Rail hover state, one frame stale by design (see the draw below).
     int rail_hover=-1;
     float rail_scroll_x=0.0f;
     bool rail_scroll_ready=false;
-    // GDI import: async zenity .gdi picker, then a forked
-    // tools/import_gdi.py child that fills the game's disc/ folder.
+    // GDI import: one async zenity .gdi picker at a time (single-file
+    // selection), then a forked tools/import_gdi.py child PER GAME. The
+    // Game files screen lets you queue imports for several games while
+    // earlier ones are still on disk.
     pid_t gdi_pid=0;
     int gdi_fd=-1, gdi_game=0;
     std::string gdi_text;
-    pid_t import_pid=0;
-    int import_game=0;
-    std::string import_log;
+    std::vector<pid_t> import_pid;
+    std::vector<std::string> import_log;
     bool confirming_clear=false;
     int clear_game=0;
 };
@@ -288,13 +295,25 @@ int main(int argc,char **argv){
     int lock=open((cfg/"launcher.lock").c_str(),O_CREAT|O_RDWR|O_CLOEXEC,0600);
     if(lock<0||flock(lock,LOCK_EX|LOCK_NB)){fprintf(stderr,"Launcher is already open or config is not writable\n");return 1;}
 
-    std::array<Game,3> games={
-        Game{"powerstone","Power Stone","CAPCOM / 1999","powerstone-native","powerstone_host",
-             "SH4 binary recompiled to C, built as","native x86-64 - no emulator anywhere."},
-        Game{"powerstone2","Power Stone 2","CAPCOM / 2000","powerstone2-native","powerstone2_host",
-             "Same 100% native SH4-to-C treatment as","Power Stone. Import its .gdi to install."},
-        Game{"msr","Metropolis Street Racer","BIZARRE CREATIONS / 2000","msr-native","msr_host",
-             "Bizarre's SH4 code recompiled to native C;","renderer mapped to raylib/OpenGL, no emulator."}};
+    // Build the rail from the candidates whose launch.sh is on disk. A
+    // game without a launch.sh is dropped entirely (no "missing launcher"
+    // surprise when the user presses Play). max_fps caps the global
+    // FPS setting at launch; MSR is locked to its native 30Hz.
+    std::vector<Game> games;
+    {
+        const std::vector<Game> all={
+            Game{"powerstone","Power Stone","CAPCOM / 1999","powerstone-native","powerstone_host",
+                 "SH4 binary recompiled to C, built as","native x86-64 - no emulator anywhere.",120},
+            Game{"powerstone2","Power Stone 2","CAPCOM / 2000","powerstone2-native","powerstone2_host",
+                 "Same 100% native SH4-to-C treatment as","Power Stone. Import its .gdi to install.",120},
+            Game{"msr","Metropolis Street Racer","BIZARRE CREATIONS / 2000","msr-native","msr_host",
+                 "Bizarre's SH4 code recompiled to native C;","renderer mapped to raylib/OpenGL, no emulator.",30}};
+        std::error_code ec;
+        for(const auto &g:all){
+            if(fs::exists(home/g.dir/"launch.sh",ec))games.push_back(g);
+            ec.clear();
+        }
+    }
     // Settings are global (one per launcher, not one per game). Save data
     // is per game and gets stamped into Settings.saves at launch() time.
     Settings gs;
@@ -331,7 +350,7 @@ int main(int argc,char **argv){
 
     // Cover art: assets/<id>.png next to the launcher, then the game dir
     // (icon.png, assets/*.png, any *.png near the root), else the letter tile.
-    std::array<ScopedTexture,3> tiles;
+    std::vector<ScopedTexture> tiles(games.size());
     for(int i=0;i<(int)games.size();i++){
         const fs::path root=home/games[i].dir;
         const fs::path asset=home/"recomp-launcher/assets"/(std::string(games[i].id)+".png");
@@ -360,10 +379,10 @@ int main(int argc,char **argv){
     }
 
     State st;
+    st.import_pid.assign(games.size(),(pid_t)0);
+    st.import_log.assign(games.size(),std::string{});
     const char *const kHomeItems[]={"Play","Game files","Settings","About","Quit"};
     const int kHomeCount=5;
-    const char *const kFilesItems[]={"Import GDI image...","Clear imported data","Back"};
-    const int kFilesCount=3;
     const char *const kSettingsItems[]={"Frame-rate limit","FPS overlay","Renderer",
                                        "Controller","External pad device"};
     const int kSettingsCount=5;
@@ -381,8 +400,8 @@ int main(int argc,char **argv){
         else tool=home/"recomp-launcher/tools/import_gdi.py";
         if(!fs::exists(tool))throw std::runtime_error("Import tool not found: "+tool.string());
         fs::create_directories(data/"logs");
-        st.import_log=(data/"logs"/(std::string(ig.id)+"-import-"+std::to_string(time(nullptr))+".log")).string();
-        int fd=open(st.import_log.c_str(),O_WRONLY|O_CREAT|O_APPEND,0600);
+        st.import_log[gi]=(data/"logs"/(std::string(ig.id)+"-import-"+std::to_string(time(nullptr))+".log")).string();
+        int fd=open(st.import_log[gi].c_str(),O_WRONLY|O_CREAT|O_APPEND,0600);
         if(fd<0)throw std::runtime_error("Cannot create import log");
         pid_t pid=fork();
         if(pid==0){
@@ -392,14 +411,15 @@ int main(int argc,char **argv){
             perror("exec import");_exit(127);
         }
         close(fd);if(pid<0)throw std::runtime_error("Cannot start import");
-        st.import_pid=pid;st.import_game=gi;
+        st.import_pid[gi]=pid;
     };
     // One cycler for the global settings rows, shared by pad, keyboard and
     // mouse. Every mutation auto-saves: leaving the menu with a half-saved
     // renderer choice is worse than one extra fsync.
     auto cycle_settings=[&](int row,int dir){
+        const int max_fps=games[st.selected].max_fps;
         switch(row){
-            case 0: gs.fps=cycle_fps(gs.fps,dir);break;
+            case 0: gs.fps=cycle_fps(gs.fps,dir,max_fps);break;
             case 1: gs.show=!gs.show;break;
             case 2: gs.renderer=gs.renderer?0:1;break;
             case 3: gs.mode=gs.mode==2?0:2;break;
@@ -410,37 +430,33 @@ int main(int argc,char **argv){
             set_status("Settings saved");
         }catch(const std::exception &e){set_status(e.what(),true);}
     };
-    // Files rows: import, clear (asks first), back.
-    auto cycle_files=[&](int row){
-        Game &g=games[st.selected];
-        switch(row){
-            case 0: { // Import GDI image, via zenity (async, non-blocking)
-                if(st.gdi_fd>=0||st.import_pid||g.pid)break;
-                int pipes[2];
-                if(pipe(pipes)==0){
-                    st.gdi_pid=fork();
-                    if(st.gdi_pid==0){
-                        dup2(pipes[1],STDOUT_FILENO);close(pipes[0]);close(pipes[1]);
-                        execlp("zenity","zenity","--file-selection",
-                               "--title=Choose a Dreamcast .gdi dump (or a zip holding one)",
-                               "--file-filter=Dreamcast GDI | *.gdi *.GDI *.zip *.ZIP",(char*)nullptr);
-                        _exit(127);
-                    }
-                    close(pipes[1]);
-                    if(st.gdi_pid>0){
-                        st.gdi_fd=pipes[0];fcntl(st.gdi_fd,F_SETFL,O_NONBLOCK);
-                        st.gdi_text.clear();st.gdi_game=st.selected;
-                    }else close(pipes[0]);
-                }
-                break;
-            }
-            case 1: // Clear imported data (asks for confirmation)
-                if(g.pid||st.import_pid||st.gdi_fd>=0)break;
-                st.confirming_clear=true;st.clear_game=st.selected;
-                break;
-            case 2:
-                st.screen=Screen::Home;break;
+    // Files rows: one row per game (status) + 3 action rows that target
+    // files_game (the LB/RB-selected game). Import GDI is non-blocking and
+    // per-game, so the user can pick a .gdi for game A, navigate to game B,
+    // and pick another .gdi while A's import is still on disk.
+    auto start_picker_for=[&](int gi){
+        if(st.gdi_fd>=0)return;
+        const Game &g=games[gi];
+        if(g.pid)return;
+        int pipes[2];
+        if(pipe(pipes)!=0)return;
+        st.gdi_pid=fork();
+        if(st.gdi_pid==0){
+            dup2(pipes[1],STDOUT_FILENO);close(pipes[0]);close(pipes[1]);
+            execlp("zenity","zenity","--file-selection",
+                   "--title=Choose a Dreamcast .gdi dump (or a zip holding one)",
+                   "--file-filter=Dreamcast GDI | *.gdi *.GDI *.zip *.ZIP",(char*)nullptr);
+            _exit(127);
         }
+        close(pipes[1]);
+        if(st.gdi_pid>0){
+            st.gdi_fd=pipes[0];fcntl(st.gdi_fd,F_SETFL,O_NONBLOCK);
+            st.gdi_text.clear();st.gdi_game=gi;
+        }else close(pipes[0]);
+    };
+    auto request_clear_for=[&](int gi){
+        if(games[gi].pid||st.import_pid[gi]||st.gdi_fd>=0)return;
+        st.confirming_clear=true;st.clear_game=gi;
     };
 
     auto launch=[&](Game &g,const Settings &s){
@@ -448,6 +464,11 @@ int main(int argc,char **argv){
         if(access((root/"launch.sh").c_str(),X_OK))throw std::runtime_error("Game launcher not found: "+root.string());
         Settings sforlaunch=s;
         sforlaunch.saves=(data/"saves"/g.id).string();
+        // Defensive clamp: gs.fps might have been cycled up on a previous
+        // game (Power Stone can hit 120) before the user picked MSR, which
+        // is locked to its native 30. The same value is sent to the game
+        // hosts via MSR_FPS / RECOMP_FPS below.
+        const int eff_fps=std::min(s.fps,g.max_fps);
         auto vmu=prepare_save(sforlaunch,root/"saves/vmu_a1.bin");
         fs::create_directories(data/"logs");
         g.log=(data/"logs"/(std::string(g.id)+"-"+std::to_string(time(nullptr))+".log")).string();
@@ -460,10 +481,17 @@ int main(int argc,char **argv){
                 std::string key=*e;key=key.substr(0,key.find('='));
                 if(key.rfind("MSR_",0)==0||key.rfind("PS_",0)==0||key.rfind("RECOMP_",0)==0){unsetenv(key.c_str());e=environ;}else ++e;
             }
+            // MSR's in-game clock wants UTC - the recomp reads it via the
+            // libc localtime path, and the host system's BST was being read
+            // as +8 hours from the real time. Europe/London is Bizarre's
+            // origin, but UTC keeps every location in MSR on the right
+            // wall-clock minute regardless of the host's zone.
+            if(std::strcmp(g.id,"msr")==0)setenv("TZ","UTC",1);
             const char *rend=s.renderer==1?"vulkan":"raylib";
             setenv("RECOMP_RENDERER",rend,1);setenv("POWERSTONE_RENDERER",rend,1);
             setenv("MSR_VULKAN",s.renderer==1?"1":"0",1);
-            setenv("MSR_VMU",vmu.c_str(),1);setenv("MSR_FPS",std::to_string(s.fps).c_str(),1);
+            setenv("MSR_VMU",vmu.c_str(),1);setenv("MSR_FPS",std::to_string(eff_fps).c_str(),1);
+            setenv("RECOMP_FPS",std::to_string(eff_fps).c_str(),1);
             setenv("RECOMP_PAD",mode_env(s.mode),1);
             setenv("RECOMP_GAMEPAD",s.pad.c_str(),1);setenv("RECOMP_SHOW_FPS",s.show?"1":"0",1);
             if(chdir(root.c_str())){perror("chdir");_exit(126);}
@@ -546,23 +574,33 @@ int main(int argc,char **argv){
                 }
             }
         }
-        // Reap a finished import and report.
-        if(st.import_pid){
-            int code;pid_t p=waitpid(st.import_pid,&code,WNOHANG);
-            if(p==st.import_pid){
+        // Reap a finished import per game. Multiple imports can run in parallel
+        // (one per game), so we walk all slots each frame.
+        for(int i=0;i<(int)st.import_pid.size();++i){
+            if(!st.import_pid[i])continue;
+            int code;pid_t p=waitpid(st.import_pid[i],&code,WNOHANG);
+            if(p==st.import_pid[i]){
                 const bool ok=WIFEXITED(code)&&WEXITSTATUS(code)==0;
-                st.import_pid=0;
-                set_status(ok?std::string(games[st.import_game].title)+" content imported - ready to play."
-                             :"Import failed; see log: "+st.import_log,!ok);
+                st.import_pid[i]=0;
+                set_status(ok?std::string(games[i].title)+" content imported - ready to play."
+                             :"Import failed; see log: "+st.import_log[i],!ok);
             }
         }
 
         // LB/RB switches the active game from any non-modal screen. The
         // confirmation dialog owns the keys; import is per-game and stays
-        // running if the user pages through the rail.
+        // running if the user pages through the rail. On the Files screen
+        // the LB/RB target is the action cursor (files_game) rather than
+        // the rail selection, so the user can pivot between games without
+        // changing the Home rail.
         const bool allow_switch=!st.confirming_clear;
-        if(allow_switch&&st.nav.lb!=st.nav.rb)
-            switch_game((st.selected+(st.nav.rb?1:(int)games.size()-1))%(int)games.size());
+        if(allow_switch&&st.nav.lb!=st.nav.rb){
+            const int dir=st.nav.rb?1:(int)games.size()-1;
+            if(st.screen==Screen::Files){
+                st.files_game=(st.files_game+dir)%(int)games.size();
+                st.files_sel=st.files_game; // jump cursor onto the game row
+            }else switch_game((st.selected+dir)%(int)games.size());
+        }
 
         if(st.screen==Screen::Home){
             if(st.nav.up)st.home_sel=(st.home_sel+kHomeCount-1)%kHomeCount;
@@ -586,11 +624,21 @@ int main(int argc,char **argv){
                 }
             }
         }else if(st.screen==Screen::Files){
+            // Layout: [game 0..N-1, Import GDI, Clear data, Back]. The
+            // cursor moves through all of them with UP/DOWN; A on a game
+            // row sets files_game and jumps to the Import row, A on an
+            // action row fires for files_game. LB/RB are a shortcut for
+            // moving among game rows only.
+            const int kActionCount=3;
+            const int total_rows=(int)games.size()+kActionCount;
+            const int import_row=(int)games.size();
+            const int clear_row=(int)games.size()+1;
+            const int back_row=(int)games.size()+2;
             if(st.confirming_clear){
                 if(st.nav.b||st.nav.y)st.confirming_clear=false;
                 else if(st.nav.a){
                     Game &cg=games[st.clear_game];
-                    if(cg.pid||st.import_pid){
+                    if(cg.pid||st.import_pid[st.clear_game]){
                         set_status("Cannot clear while the game or an import is running.",true);
                     }else try{
                         const fs::path disc=home/cg.dir/"disc";
@@ -608,9 +656,15 @@ int main(int argc,char **argv){
                 }
                 st.nav.consume();
             }else{
-                if(st.nav.up)st.files_sel=(st.files_sel+kFilesCount-1)%kFilesCount;
-                if(st.nav.down)st.files_sel=(st.files_sel+1)%kFilesCount;
-                if(st.nav.a)cycle_files(st.files_sel);
+                if(st.nav.up)st.files_sel=(st.files_sel+total_rows-1)%total_rows;
+                if(st.nav.down)st.files_sel=(st.files_sel+1)%total_rows;
+                if(st.nav.a){
+                    if(st.files_sel<import_row){
+                        st.files_game=st.files_sel;st.files_sel=import_row;
+                    }else if(st.files_sel==import_row)start_picker_for(st.files_game);
+                    else if(st.files_sel==clear_row)request_clear_for(st.files_game);
+                    else if(st.files_sel==back_row)st.screen=Screen::Home;
+                }
                 if(st.nav.b)st.screen=Screen::Home;
             }
         }else if(st.screen==Screen::Settings){
@@ -722,38 +776,68 @@ int main(int argc,char **argv){
             ui_text("A select   B back   LB/RB game   mouse: click / wheel",w-480,h-30,15,col_hint);
         }else if(st.screen==Screen::Files){
             ui_text("GAME FILES",margin,margin,36,RAYWHITE);
-            ui_text(std::string(g.title)+" - "+g.tag,margin,margin+44,16,col_muted);
-            const fs::path disc=home/g.dir/"disc";
-            std::error_code ec;
-            const bool has_1st=fs::exists(disc/"1ST_READ.BIN",ec);
-            const bool has_map=fs::exists(disc/"gdmap.txt",ec);
-            const bool imported=has_1st&&has_map;
-            std::string status_here;
-            if(st.import_pid&&st.import_game==st.selected)status_here="Importing...";
-            else if(imported)status_here="Content found.";
-            else if(has_1st)status_here="Content found, but gdmap.txt is missing - re-import.";
-            else status_here="No content. Import a .gdi to install.";
-            ui_text(status_here,margin,margin+72,16,imported?col_ok:col_warn);
-            ui_text(fit_left(disc.string(),14,w-2*margin),margin,margin+96,14,col_muted);
+            ui_text("Install or clear content for any game on the rail",margin,margin+44,16,col_muted);
+            // Show which game the action rows target (the "active" game).
+            const Game &fg=games[st.files_game];
+            ui_text("Actions target: "+std::string(fg.title)+" - "+fg.tag,margin,margin+72,15,col_teal);
 
-            const int item_h=48;
-            const int list_y=margin+150;
-            for(int i=0;i<kFilesCount;++i){
-                const Rectangle row{(float)margin,(float)(list_y+i*item_h),420.0f,(float)(item_h-10)};
+            const int item_h=44;
+            const int list_y=margin+108;
+            std::error_code ec;
+            // Per-game status rows first.
+            for(int i=0;i<(int)games.size();++i){
+                const Rectangle row{(float)margin,(float)(list_y+i*item_h),560.0f,(float)(item_h-8)};
                 const bool sel=i==st.files_sel;
-                const bool dim=(i!=2)&&(g.pid||st.import_pid||st.gdi_fd>=0);
-                if(row_draw(row,kFilesItems[i],sel,dim)){
-                    if(!dim)cycle_files(i);
+                const Game &gg=games[i];
+                const fs::path disc=home/gg.dir/"disc";
+                const bool has_1st=fs::exists(disc/"1ST_READ.BIN",ec);
+                const bool has_map=fs::exists(disc/"gdmap.txt",ec);
+                const bool imported=has_1st&&has_map;
+                std::string tag=gg.tag;
+                std::string status_text;
+                Color st_col;
+                if(st.import_pid[i]){status_text="Importing...";st_col=col_teal;}
+                else if(imported){status_text="Content imported";st_col=col_ok;}
+                else if(has_1st){status_text="gdmap.txt missing - re-import";st_col=col_warn;}
+                else if(gg.pid){status_text="Game running";st_col=col_ok;}
+                else {status_text="No content";st_col=col_warn;}
+                DrawRectangleRounded(row,0.18f,8,sel?col_sel:col_panel);
+                if(sel)DrawRectangleRoundedLinesEx(row,0.18f,8,2.0f,col_outline);
+                ui_text(gg.title,(int)row.x+18,(int)row.y+((int)row.height-22)/2,22,RAYWHITE);
+                const float title_w=ui_measure(gg.title,22);
+                ui_text(tag,(int)(row.x+24+title_w),(int)row.y+((int)row.height-14)/2,14,col_muted);
+                ui_text(status_text,(int)(row.x+row.width-18-ui_measure(status_text,18)),(int)row.y+((int)row.height-18)/2,18,st_col);
+                if(sel&&hit(row)&&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
+                    st.files_game=i;st.files_sel=i;
                 }
-                // Mouse: click selects; A on the highlighted row fires.
+            }
+            // Three action rows below the game list.
+            const char *const kActions[]={"Import GDI image...","Clear imported data","Back"};
+            const int action_y=list_y+(int)games.size()*item_h+8;
+            for(int i=0;i<3;++i){
+                const int row_idx=(int)games.size()+i;
+                const Rectangle row{(float)margin,(float)(action_y+i*item_h),560.0f,(float)(item_h-8)};
+                const bool sel=row_idx==st.files_sel;
+                const bool dim=(i==0)&&(st.gdi_fd>=0)
+                    || (i==1)&&(fg.pid||st.import_pid[st.files_game]||st.gdi_fd>=0);
+                if(row_draw(row,kActions[i],sel,dim)){
+                    if(!dim){
+                        if(i==0)start_picker_for(st.files_game);
+                        else if(i==1)request_clear_for(st.files_game);
+                        else st.screen=Screen::Home;
+                    }
+                }
                 if(!dim&&hit(row)&&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
-                    if(st.files_sel==i)cycle_files(i);
-                    else st.files_sel=i;
+                    if(st.files_sel==row_idx){
+                        if(i==0)start_picker_for(st.files_game);
+                        else if(i==1)request_clear_for(st.files_game);
+                        else st.screen=Screen::Home;
+                    }else st.files_sel=row_idx;
                 }
             }
 
             ui_text(status,margin,h-72,18,status_err?col_err:col_ok);
-            ui_text("A select   B back   LB/RB game",margin,h-28,15,col_hint);
+            ui_text("A select   B back   LB/RB: target game",margin,h-28,15,col_hint);
         }else if(st.screen==Screen::Settings){
             ui_text("SETTINGS",margin,margin,36,RAYWHITE);
             ui_text("Shared by every game in the rail",margin,margin+44,16,col_muted);
