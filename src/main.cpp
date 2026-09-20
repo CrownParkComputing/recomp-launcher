@@ -317,16 +317,21 @@ int main(int argc,char **argv){
     // Build the rail from the candidates whose launch.sh is on disk. A
     // game without a launch.sh is dropped entirely (no "missing launcher"
     // surprise when the user presses Play). max_fps caps the global
-    // FPS setting at launch; MSR is locked to its native 30Hz.
+    // FPS setting at launch; MSR is locked to its native 30Hz. Power
+    // Stone 2 and Hydro Thunder use launch.sh stubs while their SH4-to-C
+    // recomp sources are still in flight; the stubs print a clear message
+    // so Play surfaces it as the game's status.
     std::vector<Game> games;
     {
         const std::vector<Game> all={
             Game{"powerstone","Power Stone","CAPCOM / 1999","powerstone-native","powerstone_host",
                  "SH4 binary recompiled to C, built as","native x86-64 - no emulator anywhere.",120},
             Game{"powerstone2","Power Stone 2","CAPCOM / 2000","powerstone2-native","powerstone2_host",
-                 "Same 100% native SH4-to-C treatment as","Power Stone. Import its .gdi to install.",120},
+                 "Same 100% native SH4-to-C treatment as","Power Stone. Disc is imported.",60},
             Game{"msr","Metropolis Street Racer","BIZARRE CREATIONS / 2000","msr-native","msr_host",
-                 "Bizarre's SH4 code recompiled to native C;","renderer mapped to raylib/OpenGL, no emulator.",30}};
+                 "Bizarre's SH4 code recompiled to native C;","renderer mapped to raylib/OpenGL, no emulator.",30},
+            Game{"hydrothunder","Hydro Thunder","MIDWAY / 1999","hydrothunder-native","hydrothunder_host",
+                 "Midway's arcade racer recompiled to native C;","Dreamcast GD-ROM dump imported.",60}};
         std::error_code ec;
         for(const auto &g:all){
             if(fs::exists(home/g.dir/"launch.sh",ec))games.push_back(g);
