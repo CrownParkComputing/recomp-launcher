@@ -153,6 +153,25 @@ static int cycle_fps(int fps,int dir,int max_fps){
     return valid[(at+dir+nv)%nv];
 }
 
+// Graphics improvement cyclers. Each is a small ring; the Settings row
+// shows the current value and the launcher forwards it to the game hosts
+// as RECOMP_MSAA / RECOMP_RESOLUTION / RECOMP_ANISO.
+static int cycle_msaa(int v,int dir){
+    const int opts[]={1,2,4,8};const int n=4;
+    int at=0;for(int i=0;i<n;i++)if(v==opts[i])at=i;
+    return opts[(at+dir+n)%n];
+}
+static int cycle_resolution(int v,int dir){
+    const int opts[]={50,75,100,150,200};const int n=5;
+    int at=0;for(int i=0;i<n;i++)if(v==opts[i])at=i;
+    return opts[(at+dir+n)%n];
+}
+static int cycle_aniso(int v,int dir){
+    const int opts[]={1,2,4,8,16};const int n=5;
+    int at=0;for(int i=0;i<n;i++)if(v==opts[i])at=i;
+    return opts[(at+dir+n)%n];
+}
+
 /* ---- input: one-frame edges from every pad plus the keyboard ------------ */
 struct Nav {
     bool up=false,down=false,left=false,right=false,
@@ -384,8 +403,9 @@ int main(int argc,char **argv){
     const char *const kHomeItems[]={"Play","Game files","Settings","About","Quit"};
     const int kHomeCount=5;
     const char *const kSettingsItems[]={"Frame-rate limit","FPS overlay","Renderer",
-                                       "Controller","External pad device"};
-    const int kSettingsCount=5;
+                                       "Controller","External pad device",
+                                       "MSAA","Internal resolution","Anisotropic filtering"};
+    const int kSettingsCount=8;
     const float kRowW=560.0f;   // settings rows; the GLOBAL heading sits right of them
 
     // Fork tools/import_gdi.py for game gi on the picked .gdi path; output
@@ -424,6 +444,9 @@ int main(int argc,char **argv){
             case 2: gs.renderer=gs.renderer?0:1;break;
             case 3: gs.mode=gs.mode==2?0:2;break;
             case 4: if(gs.mode==0)gs.pad=cycle_pad(gs.pad,dir);break;
+            case 5: gs.msaa=cycle_msaa(gs.msaa,dir);break;
+            case 6: gs.resolution=cycle_resolution(gs.resolution,dir);break;
+            case 7: gs.aniso=cycle_aniso(gs.aniso,dir);break;
         }
         try{
             save_settings(cfg/"launcher.conf",gs);
@@ -494,6 +517,10 @@ int main(int argc,char **argv){
             setenv("RECOMP_FPS",std::to_string(eff_fps).c_str(),1);
             setenv("RECOMP_PAD",mode_env(s.mode),1);
             setenv("RECOMP_GAMEPAD",s.pad.c_str(),1);setenv("RECOMP_SHOW_FPS",s.show?"1":"0",1);
+            // Graphics improvements. Hosts that don't read them are unaffected.
+            setenv("RECOMP_MSAA",std::to_string(s.msaa).c_str(),1);
+            setenv("RECOMP_RESOLUTION",std::to_string(s.resolution).c_str(),1);
+            setenv("RECOMP_ANISO",std::to_string(s.aniso).c_str(),1);
             if(chdir(root.c_str())){perror("chdir");_exit(126);}
             execl("./launch.sh","./launch.sh",(char*)nullptr);perror("exec launch");_exit(127);
         }
@@ -846,9 +873,13 @@ int main(int argc,char **argv){
             const std::string pad_name=gs.pad.empty()
                 ?"Automatic: "+(real_pads.empty()?"no mapped pad found":real_pads.front())
                 :gs.pad;
-            const std::string values[]={std::to_string(gs.fps)+" FPS",gs.show?"On":"Off",
-                                        gs.renderer?"Vulkan (SDL3)":"OpenGL (raylib)",
-                                        mode_label(gs.mode),pad_name};
+            const std::string values[]={
+                std::to_string(gs.fps)+" FPS",gs.show?"On":"Off",
+                gs.renderer?"Vulkan (SDL3)":"OpenGL (raylib)",
+                mode_label(gs.mode),pad_name,
+                std::to_string(gs.msaa)+"x",
+                std::to_string(gs.resolution)+" %",
+                std::to_string(gs.aniso)+"x"};
             const int item_h=52;
             const int list_y=margin+100;
             for(int i=0;i<kSettingsCount;++i){
