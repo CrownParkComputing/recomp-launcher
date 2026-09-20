@@ -4,12 +4,22 @@
 //
 //   recomp-launcher [--smoke <seconds>] [--launch <id>]
 //
-// Home is a game icon rail plus the text rows Play / Settings / Quit.
-// Settings are per game (FPS cap, FPS overlay, renderer, controller mode,
-// pad device) and persist through settings.hpp; the same page imports a
-// game's content from a .gdi dump and clears it again. Play forks the
-// game's own launch.sh with the recomp environment and logs its output;
-// the menu waits for the child.
+// The launcher has four screens, all reachable from the rail at the top of
+// the Home screen:
+//
+//   Home      Play / Game files / Settings / About / Quit
+//   Files     Import GDI image... / Clear imported data / Back
+//   Settings  Frame-rate limit / FPS overlay / Renderer / Controller /
+//             External pad device - global, auto-saved per change.
+//   About     100% native details and per-game diagnostics for the rail
+//             entry that was active when About was opened.
+//
+// Settings are global (one launcher.conf under ~/.config/recomp-launcher/),
+// so a pad you picked on one game is still the pad on the next. Save data
+// is per game: each game gets its own saves/<id>/ directory under the
+// launcher's XDG data root, and the VMU file lives there. Play forks the
+// game's own launch.sh with the recomp environment and logs to
+// ~/.local/share/recomp-launcher/logs/; the menu waits for the child.
 #include "raylib.h"
 #include "settings.hpp"
 #include <sys/wait.h>
@@ -119,8 +129,7 @@ private:
 /* ---- the games ----------------------------------------------------------- */
 struct Game {
     const char *id,*title,*tag,*dir,*host;
-    const char *how1,*how2; // how the port runs, drawn in the details block
-    Settings settings;
+    const char *how1,*how2; // how the port runs, drawn in the About block
     pid_t pid=0;
     std::string log;
 };
@@ -137,81 +146,6 @@ static int cycle_fps(int fps,int dir){
     const int rates[]={30,60,120};
     int at=1;for(int i=0;i<3;i++)if(fps==rates[i])at=i;
     return rates[(at+dir+3)%3];
-}
-
-// Play: save settings, then fork the game's launch.sh with the recomp
-// environment. The child clears inherited MSR_/PS_/RECOMP_ diagnostics
-// first, so a desktop launch never silently times out or hides.
-static void launch(Game &g,const fs::path &home,const fs::path &data,const fs::path &cfg){
-    save_settings(cfg/(std::string(g.id)+".conf"),g.settings);
-    fs::path root=home/g.dir;
-    if(access((root/"launch.sh").c_str(),X_OK))throw std::runtime_error("Game launcher not found: "+root.string());
-    auto vmu=prepare_save(g.settings,root/"saves/vmu_a1.bin");
-    fs::create_directories(data/"logs");
-    g.log=(data/"logs"/(std::string(g.id)+"-"+std::to_string(time(nullptr))+".log")).string();
-    int fd=open(g.log.c_str(),O_WRONLY|O_CREAT|O_APPEND,0600);
-    if(fd<0)throw std::runtime_error("Cannot create game log");
-    pid_t pid=fork();
-    if(pid==0){
-        dup2(fd,STDOUT_FILENO);dup2(fd,STDERR_FILENO);close(fd);
-        for(char **e=environ;*e;){
-            std::string key=*e;key=key.substr(0,key.find('='));
-            if(key.rfind("MSR_",0)==0||key.rfind("PS_",0)==0||key.rfind("RECOMP_",0)==0){unsetenv(key.c_str());e=environ;}else ++e;
-        }
-        const char *rend=g.settings.renderer==1?"vulkan":"raylib";
-        setenv("RECOMP_RENDERER",rend,1);setenv("POWERSTONE_RENDERER",rend,1);
-        setenv("MSR_VULKAN",g.settings.renderer==1?"1":"0",1);
-        setenv("MSR_VMU",vmu.c_str(),1);setenv("MSR_FPS",std::to_string(g.settings.fps).c_str(),1);
-        setenv("RECOMP_PAD",mode_env(g.settings.mode),1);
-        setenv("RECOMP_GAMEPAD",g.settings.pad.c_str(),1);setenv("RECOMP_SHOW_FPS",g.settings.show?"1":"0",1);
-        if(chdir(root.c_str())){perror("chdir");_exit(126);}
-        execl("./launch.sh","./launch.sh",(char*)nullptr);perror("exec launch");_exit(127);
-    }
-    close(fd);if(pid<0)throw std::runtime_error("Cannot start game");g.pid=pid;
-}
-
-/* ---- real pads only ------------------------------------------------------ */
-// GLFW's mapping check filters out wireless mouse dongles and other
-// joystick-shaped noise; what remains is what the picker offers.
-static std::vector<std::string> mapped_pads(){
-    std::vector<std::string> out;
-    for(int i=0;i<16;i++)
-        if(IsGamepadAvailable(i)&&glfwJoystickIsGamepad(i)){
-            const char *n=GetGamepadName(i);
-            out.push_back(n&&*n?n:"Unknown pad");
-        }
-    return out;
-}
-static std::string cycle_pad(const std::string &cur,int dir){
-    std::vector<std::string> pads={""}; // "" = automatic: first mapped pad
-    const auto real=mapped_pads();
-    pads.insert(pads.end(),real.begin(),real.end());
-    auto it=std::find(pads.begin(),pads.end(),cur);
-    const size_t at=it==pads.end()?0:(size_t)(it-pads.begin());
-    return pads[(at+(dir>0?1:pads.size()-1))%pads.size()];
-}
-
-/* ---- save data: symlink-safe helpers ------------------------------------- */
-// Refuse a path that is, or passes through, a symbolic link.
-static void refuse_symlinks(const fs::path &p,const fs::path &root){
-    for(fs::path q=p;!q.empty();q=q.parent_path()){
-        if(fs::is_symlink(q))throw std::runtime_error("Save path contains a symbolic link");
-        if(q==root||!q.has_parent_path())break;
-    }
-}
-
-// The newest game log in the launcher's log dir, for the details block.
-static std::string latest_log(const fs::path &data,const std::string &id){
-    std::error_code ec;
-    fs::path best;fs::file_time_type best_time{};
-    for(const auto &e:fs::directory_iterator(data/"logs",ec)){
-        const auto n=e.path().filename().string();
-        if(n.rfind(id+"-",0)!=0||n.size()<5||n.compare(n.size()-4,4,".log")!=0){ec.clear();continue;}
-        const auto t=fs::last_write_time(e,ec);
-        if(ec){ec.clear();continue;}
-        if(best.empty()||t>best_time){best=e.path();best_time=t;}
-    }
-    return best.empty()?"":best.string();
 }
 
 /* ---- input: one-frame edges from every pad plus the keyboard ------------ */
@@ -252,6 +186,50 @@ static void poll_input(Nav &nav){
     if(IsKeyPressed(KEY_PAGE_DOWN))nav.rb=true;
 }
 
+/* ---- real pads only ------------------------------------------------------ */
+// GLFW's mapping check filters out wireless mouse dongles and other
+// joystick-shaped noise; what remains is what the picker offers.
+static std::vector<std::string> mapped_pads(){
+    std::vector<std::string> out;
+    for(int i=0;i<16;i++)
+        if(IsGamepadAvailable(i)&&glfwJoystickIsGamepad(i)){
+            const char *n=GetGamepadName(i);
+            out.push_back(n&&*n?n:"Unknown pad");
+        }
+    return out;
+}
+static std::string cycle_pad(const std::string &cur,int dir){
+    std::vector<std::string> pads={""}; // "" = automatic: first mapped pad
+    const auto real=mapped_pads();
+    pads.insert(pads.end(),real.begin(),real.end());
+    auto it=std::find(pads.begin(),pads.end(),cur);
+    const size_t at=it==pads.end()?0:(size_t)(it-pads.begin());
+    return pads[(at+(dir>0?1:pads.size()-1))%pads.size()];
+}
+
+/* ---- save data: symlink-safe helpers ------------------------------------- */
+// Refuse a path that is, or passes through, a symbolic link.
+static void refuse_symlinks(const fs::path &p,const fs::path &root){
+    for(fs::path q=p;!q.empty();q=q.parent_path()){
+        if(fs::is_symlink(q))throw std::runtime_error("Save path contains a symbolic link");
+        if(q==root||!q.has_parent_path())break;
+    }
+}
+
+// The newest game log in the launcher's log dir, for the About block.
+static std::string latest_log(const fs::path &data,const std::string &id){
+    std::error_code ec;
+    fs::path best;fs::file_time_type best_time{};
+    for(const auto &e:fs::directory_iterator(data/"logs",ec)){
+        const auto n=e.path().filename().string();
+        if(n.rfind(id+"-",0)!=0||n.size()<5||n.compare(n.size()-4,4,".log")!=0){ec.clear();continue;}
+        const auto t=fs::last_write_time(e,ec);
+        if(ec){ec.clear();continue;}
+        if(best.empty()||t>best_time){best=e.path();best_time=t;}
+    }
+    return best.empty()?"":best.string();
+}
+
 /* ---- rows ---------------------------------------------------------------- */
 static bool hit(Rectangle r){return CheckCollisionPointRec(GetMousePosition(),r);}
 // A menu row in the rexmenu style; returns true on click. dim greys it out.
@@ -274,7 +252,30 @@ static void row_value(Rectangle r,const std::string &label,const std::string &va
     ui_text(v,(int)(r.x+r.width-18-ui_measure(v,24)),(int)r.y+((int)r.height-24)/2,24,text);
 }
 
-enum class Screen { Home, Settings };
+enum class Screen { Home, Settings, Files, About };
+
+// All the per-frame UI state in one place. Held by reference through the
+// main loop; the launcher is single-threaded so passing it around is cheap.
+struct State {
+    int selected=0;
+    Screen screen=Screen::Home;
+    Nav nav{};
+    int home_sel=0, settings_sel=0, files_sel=0;
+    // Rail hover state, one frame stale by design (see the draw below).
+    int rail_hover=-1;
+    float rail_scroll_x=0.0f;
+    bool rail_scroll_ready=false;
+    // GDI import: async zenity .gdi picker, then a forked
+    // tools/import_gdi.py child that fills the game's disc/ folder.
+    pid_t gdi_pid=0;
+    int gdi_fd=-1, gdi_game=0;
+    std::string gdi_text;
+    pid_t import_pid=0;
+    int import_game=0;
+    std::string import_log;
+    bool confirming_clear=false;
+    int clear_game=0;
+};
 
 int main(int argc,char **argv){
     try {
@@ -289,22 +290,28 @@ int main(int argc,char **argv){
 
     std::array<Game,3> games={
         Game{"powerstone","Power Stone","CAPCOM / 1999","powerstone-native","powerstone_host",
-             "SH4 binary recompiled to C, built as","native x86-64 - no emulator anywhere.",
-             Settings{},0,{}},
+             "SH4 binary recompiled to C, built as","native x86-64 - no emulator anywhere."},
         Game{"powerstone2","Power Stone 2","CAPCOM / 2000","powerstone2-native","powerstone2_host",
-             "Same 100% native SH4-to-C treatment as","Power Stone. Import its .gdi to install.",
-             Settings{},0,{}},
+             "Same 100% native SH4-to-C treatment as","Power Stone. Import its .gdi to install."},
         Game{"msr","Metropolis Street Racer","BIZARRE CREATIONS / 2000","msr-native","msr_host",
-             "Bizarre's SH4 code recompiled to native C;","renderer mapped to raylib/OpenGL, no emulator.",
-             Settings{},0,{}}};
-    std::string status="Choose a game. Settings are saved per game.";
+             "Bizarre's SH4 code recompiled to native C;","renderer mapped to raylib/OpenGL, no emulator."}};
+    // Settings are global (one per launcher, not one per game). Save data
+    // is per game and gets stamped into Settings.saves at launch() time.
+    Settings gs;
+    std::string status="Choose a game.";
     bool status_err=false;
-    for(auto &g:games){
-        g.settings.saves=(data/"saves"/g.id).string();
-        try{g.settings=load_settings(cfg/(std::string(g.id)+".conf"),g.settings);}
-        catch(const std::exception &e){status=e.what();status_err=true;}
-        g.settings.mode=fixed_mode(g.settings.mode); // legacy virtual pad -> external
+    try{gs=load_settings(cfg/"launcher.conf",gs);}
+    catch(const std::exception &e){status=e.what();status_err=true;}
+    // Make sure gs.saves is an absolute path before cycle_settings is ever
+    // asked to auto-save; the value persisted in launcher.conf is just a
+    // placeholder - launch() overwrites it with the per-game folder.
+    if(!fs::path(gs.saves).is_absolute())
+        gs.saves=(data/"saves"/games[0].id).string();
+    for(const auto &g:games){
+        std::error_code ec;
+        fs::create_directories(data/"saves"/g.id,ec);
     }
+    gs.mode=fixed_mode(gs.mode); // legacy virtual pad -> external
     auto set_status=[&](const std::string &s,bool err=false){status=s;status_err=err;};
 
     double smoke=0;int auto_game=-1;
@@ -352,61 +359,20 @@ int main(int argc,char **argv){
         }
     }
 
-    int selected=0;             // active game
-    Screen screen=Screen::Home;
-    Nav nav;
-    int home_sel=0,settings_sel=0;
-    // Rail hover state, one frame stale by design (see the draw below).
-    int rail_hover=-1;
-    float rail_scroll_x=0.0f;
-    bool rail_scroll_ready=false;
-    // GDI import: async zenity .gdi picker, then a forked
-    // tools/import_gdi.py child that fills the game's disc/ folder.
-    pid_t gdi_pid=0;int gdi_fd=-1,gdi_game=0;std::string gdi_text;
-    pid_t import_pid=0;int import_game=0;std::string import_log;
-    bool confirming_clear=false;
-    int clear_game=0;
+    State st;
+    const char *const kHomeItems[]={"Play","Game files","Settings","About","Quit"};
+    const int kHomeCount=5;
+    const char *const kFilesItems[]={"Import GDI image...","Clear imported data","Back"};
+    const int kFilesCount=3;
+    const char *const kSettingsItems[]={"Frame-rate limit","FPS overlay","Renderer",
+                                       "Controller","External pad device"};
+    const int kSettingsCount=5;
+    const float kRowW=560.0f;   // settings rows; the GLOBAL heading sits right of them
 
-    const char *const kHomeItems[]={"Play","Settings","Quit"};
-    const int kHomeCount=3;
-    const int kSettingsCount=8; // fps, overlay, renderer, mode, pad, import, clear, save
-    const float kRowW=560.0f;   // settings rows; the details block sits right of them
-
-    if(auto_game>=0){
-        selected=auto_game;
-        try{launch(games[selected],home,data,cfg);set_status("Running "+std::string(games[selected].title));}
-        catch(const std::exception &e){set_status(e.what(),true);}
-    }
-
-    auto switch_game=[&](int idx){
-        if(idx<0||idx>=(int)games.size())return;
-        selected=idx;home_sel=0;settings_sel=0;
-        confirming_clear=false;
-    };
-    auto any_running=[&]{
-        for(const auto &gg:games)if(gg.pid)return true;
-        return false;
-    };
-    auto try_play=[&]{
-        Game &g=games[selected];
-        if(any_running()){
-            set_status("A game is already running - close it before starting another.",true);
-            return;
-        }
-        std::error_code ec;
-        if(!fs::exists(home/g.dir/"disc/1ST_READ.BIN",ec)){
-            set_status(std::string(g.title)+" has no game content yet - import a .gdi first (Settings > Import GDI image).",true);
-            return;
-        }
-        try{
-            launch(g,home,data,cfg);
-            set_status("Running "+std::string(g.title)+". Saves: "+g.settings.saves);
-        }catch(const std::exception &e){set_status(e.what(),true);}
-    };
     // Fork tools/import_gdi.py for game gi on the picked .gdi path; output
     // goes to a per-import log so a failure is diagnosable after the fact.
     auto start_import=[&](int gi,const std::string &gdi_path){
-        Game &ig=games[gi];
+        const Game &ig=games[gi];
         std::error_code ec;
         const fs::path self=fs::canonical("/proc/self/exe",ec);
         fs::path tool;
@@ -415,8 +381,8 @@ int main(int argc,char **argv){
         else tool=home/"recomp-launcher/tools/import_gdi.py";
         if(!fs::exists(tool))throw std::runtime_error("Import tool not found: "+tool.string());
         fs::create_directories(data/"logs");
-        import_log=(data/"logs"/(std::string(ig.id)+"-import-"+std::to_string(time(nullptr))+".log")).string();
-        int fd=open(import_log.c_str(),O_WRONLY|O_CREAT|O_APPEND,0600);
+        st.import_log=(data/"logs"/(std::string(ig.id)+"-import-"+std::to_string(time(nullptr))+".log")).string();
+        int fd=open(st.import_log.c_str(),O_WRONLY|O_CREAT|O_APPEND,0600);
         if(fd<0)throw std::runtime_error("Cannot create import log");
         pid_t pid=fork();
         if(pid==0){
@@ -426,23 +392,34 @@ int main(int argc,char **argv){
             perror("exec import");_exit(127);
         }
         close(fd);if(pid<0)throw std::runtime_error("Cannot start import");
-        import_pid=pid;import_game=gi;
+        st.import_pid=pid;st.import_game=gi;
     };
-    // One cycler for the settings rows, shared by pad, keyboard and mouse.
+    // One cycler for the global settings rows, shared by pad, keyboard and
+    // mouse. Every mutation auto-saves: leaving the menu with a half-saved
+    // renderer choice is worse than one extra fsync.
     auto cycle_settings=[&](int row,int dir){
-        Game &g=games[selected];Settings &s=g.settings;
         switch(row){
-            case 0: s.fps=cycle_fps(s.fps,dir);break;
-            case 1: s.show=!s.show;break;
-            case 2: s.renderer=s.renderer?0:1;break;
-            case 3: s.mode=s.mode==2?0:2;break;
-            case 4: if(s.mode==0)s.pad=cycle_pad(s.pad,dir);break;
-            case 5: { // Import GDI image, via zenity (async, non-blocking)
-                if(gdi_fd>=0||import_pid||g.pid)break;
+            case 0: gs.fps=cycle_fps(gs.fps,dir);break;
+            case 1: gs.show=!gs.show;break;
+            case 2: gs.renderer=gs.renderer?0:1;break;
+            case 3: gs.mode=gs.mode==2?0:2;break;
+            case 4: if(gs.mode==0)gs.pad=cycle_pad(gs.pad,dir);break;
+        }
+        try{
+            save_settings(cfg/"launcher.conf",gs);
+            set_status("Settings saved");
+        }catch(const std::exception &e){set_status(e.what(),true);}
+    };
+    // Files rows: import, clear (asks first), back.
+    auto cycle_files=[&](int row){
+        Game &g=games[st.selected];
+        switch(row){
+            case 0: { // Import GDI image, via zenity (async, non-blocking)
+                if(st.gdi_fd>=0||st.import_pid||g.pid)break;
                 int pipes[2];
                 if(pipe(pipes)==0){
-                    gdi_pid=fork();
-                    if(gdi_pid==0){
+                    st.gdi_pid=fork();
+                    if(st.gdi_pid==0){
                         dup2(pipes[1],STDOUT_FILENO);close(pipes[0]);close(pipes[1]);
                         execlp("zenity","zenity","--file-selection",
                                "--title=Choose a Dreamcast .gdi dump (or a zip holding one)",
@@ -450,30 +427,97 @@ int main(int argc,char **argv){
                         _exit(127);
                     }
                     close(pipes[1]);
-                    if(gdi_pid>0){gdi_fd=pipes[0];fcntl(gdi_fd,F_SETFL,O_NONBLOCK);gdi_text.clear();gdi_game=selected;}
-                    else close(pipes[0]);
+                    if(st.gdi_pid>0){
+                        st.gdi_fd=pipes[0];fcntl(st.gdi_fd,F_SETFL,O_NONBLOCK);
+                        st.gdi_text.clear();st.gdi_game=st.selected;
+                    }else close(pipes[0]);
                 }
                 break;
             }
-            case 6: // Clear imported data (asks for confirmation)
-                if(g.pid||import_pid||gdi_fd>=0)break;
-                confirming_clear=true;clear_game=selected;
+            case 1: // Clear imported data (asks for confirmation)
+                if(g.pid||st.import_pid||st.gdi_fd>=0)break;
+                st.confirming_clear=true;st.clear_game=st.selected;
                 break;
-            case 7:
-                try{
-                    save_settings(cfg/(std::string(g.id)+".conf"),s);
-                    set_status("Settings saved for "+std::string(g.title));
-                }catch(const std::exception &e){set_status(e.what(),true);}
-                break;
+            case 2:
+                st.screen=Screen::Home;break;
         }
+    };
+
+    auto launch=[&](Game &g,const Settings &s){
+        fs::path root=home/g.dir;
+        if(access((root/"launch.sh").c_str(),X_OK))throw std::runtime_error("Game launcher not found: "+root.string());
+        Settings sforlaunch=s;
+        sforlaunch.saves=(data/"saves"/g.id).string();
+        auto vmu=prepare_save(sforlaunch,root/"saves/vmu_a1.bin");
+        fs::create_directories(data/"logs");
+        g.log=(data/"logs"/(std::string(g.id)+"-"+std::to_string(time(nullptr))+".log")).string();
+        int fd=open(g.log.c_str(),O_WRONLY|O_CREAT|O_APPEND,0600);
+        if(fd<0)throw std::runtime_error("Cannot create game log");
+        pid_t pid=fork();
+        if(pid==0){
+            dup2(fd,STDOUT_FILENO);dup2(fd,STDERR_FILENO);close(fd);
+            for(char **e=environ;*e;){
+                std::string key=*e;key=key.substr(0,key.find('='));
+                if(key.rfind("MSR_",0)==0||key.rfind("PS_",0)==0||key.rfind("RECOMP_",0)==0){unsetenv(key.c_str());e=environ;}else ++e;
+            }
+            const char *rend=s.renderer==1?"vulkan":"raylib";
+            setenv("RECOMP_RENDERER",rend,1);setenv("POWERSTONE_RENDERER",rend,1);
+            setenv("MSR_VULKAN",s.renderer==1?"1":"0",1);
+            setenv("MSR_VMU",vmu.c_str(),1);setenv("MSR_FPS",std::to_string(s.fps).c_str(),1);
+            setenv("RECOMP_PAD",mode_env(s.mode),1);
+            setenv("RECOMP_GAMEPAD",s.pad.c_str(),1);setenv("RECOMP_SHOW_FPS",s.show?"1":"0",1);
+            if(chdir(root.c_str())){perror("chdir");_exit(126);}
+            execl("./launch.sh","./launch.sh",(char*)nullptr);perror("exec launch");_exit(127);
+        }
+        close(fd);if(pid<0)throw std::runtime_error("Cannot start game");g.pid=pid;
+    };
+
+    if(auto_game>=0){
+        st.selected=auto_game;
+        Game &g=games[st.selected];
+        std::error_code ec;
+        const bool has=fs::exists(home/g.dir/"disc/1ST_READ.BIN",ec);
+        if(!has)set_status(std::string(g.title)+" has no game content yet - import a .gdi first (Game files).",true);
+        else try{launch(g,gs);set_status("Running "+std::string(g.title));}
+        catch(const std::exception &e){set_status(e.what(),true);}
+    }
+
+    auto switch_game=[&](int idx){
+        if(idx<0||idx>=(int)games.size())return;
+        st.selected=idx;st.home_sel=0;st.settings_sel=0;st.files_sel=0;
+        st.confirming_clear=false;
+    };
+    auto any_running=[&]{
+        for(const auto &gg:games)if(gg.pid)return true;
+        return false;
+    };
+    auto has_content=[&](const Game &g){
+        std::error_code ec;
+        const fs::path root=home/g.dir;
+        return fs::exists(root/"disc/1ST_READ.BIN",ec)
+            && fs::exists(root/"disc/gdmap.txt",ec);
+    };
+    auto try_play=[&]{
+        Game &g=games[st.selected];
+        if(any_running()){
+            set_status("A game is already running - close it before starting another.",true);
+            return;
+        }
+        if(!has_content(g)){
+            set_status(std::string(g.title)+" has no game content yet - import a .gdi first (Game files).",true);
+            return;
+        }
+        try{
+            launch(g,gs);
+            set_status("Running "+std::string(g.title)+". Saves: "+(data/"saves"/g.id).string());
+        }catch(const std::exception &e){set_status(e.what(),true);}
     };
 
     while(!WindowShouldClose()){
         if(smoke>0&&GetTime()>smoke)break;
-        poll_input(nav);
+        poll_input(st.nav);
         const int w=GetScreenWidth(),h=GetScreenHeight();
-        Game &g=games[selected];
-        Settings &s=g.settings;
+        Game &g=games[st.selected];
 
         // Reap finished games and report how they went.
         for(auto &gg:games)if(gg.pid){
@@ -485,17 +529,17 @@ int main(int argc,char **argv){
             }
         }
         // GDI picker finished: kick off the import child for that game.
-        if(gdi_fd>=0){
+        if(st.gdi_fd>=0){
             char buf[1024];ssize_t n;
-            while((n=read(gdi_fd,buf,sizeof buf))>0)gdi_text.append(buf,n);
+            while((n=read(st.gdi_fd,buf,sizeof buf))>0)st.gdi_text.append(buf,n);
             if(n==0){
-                int code;waitpid(gdi_pid,&code,0);close(gdi_fd);gdi_fd=-1;
+                int code;waitpid(st.gdi_pid,&code,0);close(st.gdi_fd);st.gdi_fd=-1;
                 if(WIFEXITED(code)&&WEXITSTATUS(code)==0){
-                    while(!gdi_text.empty()&&(gdi_text.back()=='\n'||gdi_text.back()=='\r'))gdi_text.pop_back();
-                    if(!gdi_text.empty()){
+                    while(!st.gdi_text.empty()&&(st.gdi_text.back()=='\n'||st.gdi_text.back()=='\r'))st.gdi_text.pop_back();
+                    if(!st.gdi_text.empty()){
                         try{
-                            start_import(gdi_game,gdi_text);
-                            set_status("Importing "+std::string(games[gdi_game].title)+
+                            start_import(st.gdi_game,st.gdi_text);
+                            set_status("Importing "+std::string(games[st.gdi_game].title)+
                                        " content from the .gdi - this can take a minute...");
                         }catch(const std::exception &e){set_status(e.what(),true);}
                     }
@@ -503,46 +547,50 @@ int main(int argc,char **argv){
             }
         }
         // Reap a finished import and report.
-        if(import_pid){
-            int code;pid_t p=waitpid(import_pid,&code,WNOHANG);
-            if(p==import_pid){
+        if(st.import_pid){
+            int code;pid_t p=waitpid(st.import_pid,&code,WNOHANG);
+            if(p==st.import_pid){
                 const bool ok=WIFEXITED(code)&&WEXITSTATUS(code)==0;
-                import_pid=0;
-                set_status(ok?std::string(games[import_game].title)+" content imported - ready to play."
-                             :"Import failed; see log: "+import_log,!ok);
+                st.import_pid=0;
+                set_status(ok?std::string(games[st.import_game].title)+" content imported - ready to play."
+                             :"Import failed; see log: "+st.import_log,!ok);
             }
         }
 
-        // LB/RB switches the active game from any screen (not mid-confirm:
-        // the dialog owns the keys then).
-        if(!confirming_clear&&nav.lb!=nav.rb)
-            switch_game((selected+(nav.rb?1:(int)games.size()-1))%(int)games.size());
+        // LB/RB switches the active game from any non-modal screen. The
+        // confirmation dialog owns the keys; import is per-game and stays
+        // running if the user pages through the rail.
+        const bool allow_switch=!st.confirming_clear;
+        if(allow_switch&&st.nav.lb!=st.nav.rb)
+            switch_game((st.selected+(st.nav.rb?1:(int)games.size()-1))%(int)games.size());
 
-        if(screen==Screen::Home){
-            if(nav.up)home_sel=(home_sel+kHomeCount-1)%kHomeCount;
-            if(nav.down)home_sel=(home_sel+1)%kHomeCount;
+        if(st.screen==Screen::Home){
+            if(st.nav.up)st.home_sel=(st.home_sel+kHomeCount-1)%kHomeCount;
+            if(st.nav.down)st.home_sel=(st.home_sel+1)%kHomeCount;
             const float wheel=GetMouseWheelMove();
-            if(wheel!=0.0f)switch_game((selected+(wheel<0.0f?1:(int)games.size()-1))%(int)games.size());
+            if(wheel!=0.0f)switch_game((st.selected+(wheel<0.0f?1:(int)games.size()-1))%(int)games.size());
             // Clicking an icon: first click selects, second click switches.
-            if(rail_hover>=0&&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
-                if(selected==rail_hover)switch_game(rail_hover);
-                else selected=rail_hover;
+            if(st.rail_hover>=0&&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
+                if(st.selected==st.rail_hover)switch_game(st.rail_hover);
+                else st.selected=st.rail_hover;
             }
-            if(nav.left||nav.right)
-                switch_game((selected+(nav.right?1:(int)games.size()-1))%(int)games.size());
-            if(nav.a||nav.start){
-                switch(home_sel){
+            if(st.nav.left||st.nav.right)
+                switch_game((st.selected+(st.nav.right?1:(int)games.size()-1))%(int)games.size());
+            if(st.nav.a||st.nav.start){
+                switch(st.home_sel){
                     case 0: try_play();break;
-                    case 1: screen=Screen::Settings;settings_sel=0;break;
-                    case 2: goto done;
+                    case 1: st.screen=Screen::Files;st.files_sel=0;break;
+                    case 2: st.screen=Screen::Settings;st.settings_sel=0;break;
+                    case 3: st.screen=Screen::About;break;
+                    case 4: goto done;
                 }
             }
-        }else if(screen==Screen::Settings){
-            if(confirming_clear){
-                if(nav.b||nav.y)confirming_clear=false;
-                else if(nav.a){
-                    Game &cg=games[clear_game];
-                    if(cg.pid||import_pid){
+        }else if(st.screen==Screen::Files){
+            if(st.confirming_clear){
+                if(st.nav.b||st.nav.y)st.confirming_clear=false;
+                else if(st.nav.a){
+                    Game &cg=games[st.clear_game];
+                    if(cg.pid||st.import_pid){
                         set_status("Cannot clear while the game or an import is running.",true);
                     }else try{
                         const fs::path disc=home/cg.dir/"disc";
@@ -556,17 +604,24 @@ int main(int argc,char **argv){
                         }else fs::create_directories(disc);
                         set_status("Cleared "+std::string(cg.title)+" data - import a .gdi to reinstall the content.");
                     }catch(const std::exception &e){set_status(std::string("Clear failed: ")+e.what(),true);}
-                    confirming_clear=false;
+                    st.confirming_clear=false;
                 }
-                nav.consume();
+                st.nav.consume();
             }else{
-                if(nav.up)settings_sel=(settings_sel+kSettingsCount-1)%kSettingsCount;
-                if(nav.down)settings_sel=(settings_sel+1)%kSettingsCount;
-                const int cycle=nav.right?1:(nav.left?-1:0);
-                if(cycle)cycle_settings(settings_sel,cycle);
-                if(nav.a)cycle_settings(settings_sel,1);
-                if(nav.b)screen=Screen::Home;
+                if(st.nav.up)st.files_sel=(st.files_sel+kFilesCount-1)%kFilesCount;
+                if(st.nav.down)st.files_sel=(st.files_sel+1)%kFilesCount;
+                if(st.nav.a)cycle_files(st.files_sel);
+                if(st.nav.b)st.screen=Screen::Home;
             }
+        }else if(st.screen==Screen::Settings){
+            if(st.nav.up)st.settings_sel=(st.settings_sel+kSettingsCount-1)%kSettingsCount;
+            if(st.nav.down)st.settings_sel=(st.settings_sel+1)%kSettingsCount;
+            const int cycle=st.nav.right?1:(st.nav.left?-1:0);
+            if(cycle)cycle_settings(st.settings_sel,cycle);
+            if(st.nav.a)cycle_settings(st.settings_sel,1);
+            if(st.nav.b)st.screen=Screen::Home;
+        }else if(st.screen==Screen::About){
+            if(st.nav.b)st.screen=Screen::Home;
         }
 
         /* ---- draw ------------------------------------------------------- */
@@ -574,7 +629,7 @@ int main(int argc,char **argv){
         ClearBackground(col_bg);
         const int margin=36;
 
-        if(screen==Screen::Home){
+        if(st.screen==Screen::Home){
             ui_text("RETRO RECOMP",margin,margin,44,RAYWHITE);
             ui_text("Dreamcast native recomp library",margin,margin+52,16,col_muted);
 
@@ -583,35 +638,35 @@ int main(int argc,char **argv){
             const float cell=179.0f,icon=141.0f;
             const float rail_w=cell*(float)games.size();
             const float target_rail_x=rail_w<=w-72?(w-rail_w)/2.0f:
-                std::clamp(w/2.0f-cell*(selected+0.5f),w-36-rail_w,36.0f);
-            if(!rail_scroll_ready){rail_scroll_x=target_rail_x;rail_scroll_ready=true;}
+                std::clamp(w/2.0f-cell*(st.selected+0.5f),w-36-rail_w,36.0f);
+            if(!st.rail_scroll_ready){st.rail_scroll_x=target_rail_x;st.rail_scroll_ready=true;}
             else{
                 const float easing=std::min(1.0f,GetFrameTime()*9.0f);
-                rail_scroll_x+=(target_rail_x-rail_scroll_x)*easing;
-                if(std::abs(target_rail_x-rail_scroll_x)<0.25f)rail_scroll_x=target_rail_x;
+                st.rail_scroll_x+=(target_rail_x-st.rail_scroll_x)*easing;
+                if(std::abs(target_rail_x-st.rail_scroll_x)<0.25f)st.rail_scroll_x=target_rail_x;
             }
-            const float rail_x=rail_scroll_x;
+            const float rail_x=st.rail_scroll_x;
             const float rail_y=(float)margin+96;
-            rail_hover=-1;
+            st.rail_hover=-1;
             BeginScissorMode(margin,(int)rail_y-10,w-2*margin,(int)icon+70);
             for(int i=0;i<(int)games.size();++i){
                 const float cx=rail_x+cell*(float)i+cell/2.0f;
                 const float cy=rail_y+icon/2.0f+14.0f;
-                const bool sel=(i==selected);
+                const bool sel=(i==st.selected);
                 const Rectangle cellrec{cx-cell/2.0f+6,rail_y,cell-12,icon+28};
-                if(CheckCollisionPointRec(GetMousePosition(),cellrec))rail_hover=i;
+                if(CheckCollisionPointRec(GetMousePosition(),cellrec))st.rail_hover=i;
                 // A gentle lift for the loaded game, a stronger one for the
                 // icon under the finger.
                 float lift=sel?-4.0f:0.0f;
-                if(i==rail_hover)lift=-8.0f;
-                const float size=(sel||i==rail_hover)?icon+10.0f:icon;
+                if(i==st.rail_hover)lift=-8.0f;
+                const float size=(sel||i==st.rail_hover)?icon+10.0f:icon;
                 const Rectangle ic{cx-size/2.0f,cy-size/2.0f+lift,size,size};
-                if(i==rail_hover)DrawRectangleRounded(cellrec,0.18f,8,Color{40,110,120,120});
+                if(i==st.rail_hover)DrawRectangleRounded(cellrec,0.18f,8,Color{40,110,120,120});
                 else if(sel)DrawRectangleRounded(cellrec,0.18f,8,Color{255,255,255,18});
                 if(tiles[i].ok()){
                     DrawTexturePro(tiles[i].tex(),
                         {0,0,(float)tiles[i].tex().width,(float)tiles[i].tex().height},
-                        ic,{0,0},0.0f,sel||i==rail_hover?WHITE:Color{200,205,212,255});
+                        ic,{0,0},0.0f,sel||i==st.rail_hover?WHITE:Color{200,205,212,255});
                 }else{
                     DrawRectangleRounded(ic,0.14f,8,col_tile);
                     const std::string initial=games[i].title[0]?std::string(1,games[i].title[0]):"?";
@@ -624,123 +679,164 @@ int main(int argc,char **argv){
             EndScissorMode();
 
             // Actions under the rail.
-            std::error_code ec;
-            const bool has_content=fs::exists(home/g.dir/"disc/1ST_READ.BIN",ec);
+            const bool content=has_content(g);
             const int item_h=48;
             const int list_y=(int)rail_y+188;
             for(int i=0;i<kHomeCount;++i){
                 const Rectangle row{(float)margin,(float)(list_y+i*item_h),420.0f,(float)(item_h-10)};
-                const bool sel=i==home_sel;
+                const bool sel=i==st.home_sel;
                 const bool running=any_running();
-                const bool dim=(i==0&&(running||!has_content));
-                const std::string label=i==0
-                    ?(running?"RUNNING - close the game to return"
-                             :(has_content?"Play":"Play (import a .gdi first - Settings)"))
-                    :kHomeItems[i];
+                const bool dim=(i==0&&(running||!content));
+                std::string label=kHomeItems[i];
+                if(i==0)label=running?"RUNNING - close the game to return"
+                                 :(content?"Play":"Play (import a .gdi first - Game files)");
+                else if(i==1)label=content?"Game files (content imported)":"Game files (no content)";
                 if(row_draw(row,label,sel,dim)){
                     if(i==0)try_play();
-                    else if(i==1){screen=Screen::Settings;settings_sel=0;}
-                    else if(i==2){EndDrawing();goto done;}
+                    else if(i==1){st.screen=Screen::Files;st.files_sel=0;}
+                    else if(i==2){st.screen=Screen::Settings;st.settings_sel=0;}
+                    else if(i==3){st.screen=Screen::About;}
+                    else if(i==4){EndDrawing();goto done;}
                 }
             }
 
-            // About the active game, right of the rows.
+            // Game info + global settings, right of the rows.
             const int info_x=margin+470;
-            if(tiles[selected].ok()){
-                const auto t=tiles[selected].tex();
+            if(tiles[st.selected].ok()){
+                const auto t=tiles[st.selected].tex();
                 DrawTexturePro(t,{0,0,(float)t.width,(float)t.height},
                                {(float)info_x,(float)list_y,64,64},{0,0},0,WHITE);
             }
-            ui_text(g.title,info_x+(tiles[selected].ok()?82:0),list_y,28,RAYWHITE);
-            ui_text(g.tag,info_x+(tiles[selected].ok()?82:0),list_y+37,17,col_muted);
-            ui_text(g.pid?"Running now":(has_content?"Ready to play":"No game data imported - import a .gdi in Settings"),
-                    info_x,list_y+84,18,g.pid?col_ok:(has_content?col_warn:col_err));
-            ui_text("FPS cap: "+std::to_string(s.fps)+"   overlay: "+(s.show?"on":"off")+
-                    "   renderer: "+(s.renderer?"Vulkan":"OpenGL"),
+            ui_text(g.title,info_x+(tiles[st.selected].ok()?82:0),list_y,28,RAYWHITE);
+            ui_text(g.tag,info_x+(tiles[st.selected].ok()?82:0),list_y+37,17,col_muted);
+            ui_text(g.pid?"Running now":(content?"Ready to play":"No game data imported - import a .gdi in Game files"),
+                    info_x,list_y+84,18,g.pid?col_ok:(content?col_warn:col_err));
+            ui_text("FPS cap: "+std::to_string(gs.fps)+"   overlay: "+(gs.show?"on":"off")+
+                    "   renderer: "+(gs.renderer?"Vulkan":"OpenGL"),
                     info_x,list_y+116,16,col_muted);
-            ui_text(std::string("Controller: ")+mode_label(s.mode),info_x,list_y+140,16,col_muted);
+            ui_text(std::string("Controller: ")+mode_label(gs.mode),info_x,list_y+140,16,col_muted);
 
             ui_text(status,margin,h-72,18,status_err?col_err:col_ok);
             ui_text("F3 toggles the in-game FPS counter. Close the game with Escape.",
                     margin,h-46,15,col_hint);
             ui_text("A select   B back   LB/RB game   mouse: click / wheel",w-480,h-30,15,col_hint);
-        }else if(screen==Screen::Settings){
-            ui_text(g.title,margin,margin,36,RAYWHITE);
-            ui_text("Settings for this game",margin,margin+44,16,col_muted);
+        }else if(st.screen==Screen::Files){
+            ui_text("GAME FILES",margin,margin,36,RAYWHITE);
+            ui_text(std::string(g.title)+" - "+g.tag,margin,margin+44,16,col_muted);
+            const fs::path disc=home/g.dir/"disc";
+            std::error_code ec;
+            const bool has_1st=fs::exists(disc/"1ST_READ.BIN",ec);
+            const bool has_map=fs::exists(disc/"gdmap.txt",ec);
+            const bool imported=has_1st&&has_map;
+            std::string status_here;
+            if(st.import_pid&&st.import_game==st.selected)status_here="Importing...";
+            else if(imported)status_here="Content found.";
+            else if(has_1st)status_here="Content found, but gdmap.txt is missing - re-import.";
+            else status_here="No content. Import a .gdi to install.";
+            ui_text(status_here,margin,margin+72,16,imported?col_ok:col_warn);
+            ui_text(fit_left(disc.string(),14,w-2*margin),margin,margin+96,14,col_muted);
+
+            const int item_h=48;
+            const int list_y=margin+150;
+            for(int i=0;i<kFilesCount;++i){
+                const Rectangle row{(float)margin,(float)(list_y+i*item_h),420.0f,(float)(item_h-10)};
+                const bool sel=i==st.files_sel;
+                const bool dim=(i!=2)&&(g.pid||st.import_pid||st.gdi_fd>=0);
+                if(row_draw(row,kFilesItems[i],sel,dim)){
+                    if(!dim)cycle_files(i);
+                }
+                // Mouse: click selects; A on the highlighted row fires.
+                if(!dim&&hit(row)&&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
+                    if(st.files_sel==i)cycle_files(i);
+                    else st.files_sel=i;
+                }
+            }
+
+            ui_text(status,margin,h-72,18,status_err?col_err:col_ok);
+            ui_text("A select   B back   LB/RB game",margin,h-28,15,col_hint);
+        }else if(st.screen==Screen::Settings){
+            ui_text("SETTINGS",margin,margin,36,RAYWHITE);
+            ui_text("Shared by every game in the rail",margin,margin+44,16,col_muted);
 
             const auto real_pads=mapped_pads();
-            const std::string pad_name=s.pad.empty()
+            const std::string pad_name=gs.pad.empty()
                 ?"Automatic: "+(real_pads.empty()?"no mapped pad found":real_pads.front())
-                :s.pad;
-            const std::string labels[]={"Frame-rate limit","FPS overlay","Renderer","Controller",
-                                        "External pad device","Import GDI image...","Clear imported data","Save settings"};
-            const std::string values[]={std::to_string(s.fps)+" FPS",s.show?"On":"Off",
-                                        s.renderer?"Vulkan (SDL3)":"OpenGL (raylib)",
-                                        mode_label(s.mode),pad_name,"","",""};
+                :gs.pad;
+            const std::string values[]={std::to_string(gs.fps)+" FPS",gs.show?"On":"Off",
+                                        gs.renderer?"Vulkan (SDL3)":"OpenGL (raylib)",
+                                        mode_label(gs.mode),pad_name};
             const int item_h=52;
             const int list_y=margin+100;
             for(int i=0;i<kSettingsCount;++i){
                 const Rectangle row{(float)margin,(float)(list_y+i*item_h),kRowW,(float)(item_h-10)};
-                const bool sel=i==settings_sel;
-                const bool dim=(i==4&&s.mode!=0)||
-                    ((i==5||i==6)&&(g.pid||import_pid||gdi_fd>=0));
-                if(i>=5){
-                    row_draw(row,labels[i],sel,dim);
-                    const char *hint=i==5?"A pick a .gdi dump":i==6?"A clear (asks first)":"A save";
-                    if(sel&&!dim){
-                        const std::string h=hint;
-                        ui_text(h,(int)(row.x+row.width-14-ui_measure(h,14)),(int)row.y+16,14,col_hint);
-                    }
-                }else{
-                    row_value(row,labels[i],values[i],sel,dim);
-                }
+                const bool sel=i==st.settings_sel;
+                const bool dim=(i==4&&gs.mode!=0);
+                row_value(row,kSettingsItems[i],values[i],sel,dim);
                 // Mouse: click selects; clicking a cycler changes it.
                 if(!dim&&hit(row)&&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
-                    if(settings_sel==i)cycle_settings(i,1);
-                    else settings_sel=i;
+                    if(st.settings_sel==i)cycle_settings(i,1);
+                    else st.settings_sel=i;
                 }
             }
             int note_y=list_y+kSettingsCount*item_h+14;
-            ui_text("Limits presentation only; 120 FPS does not unlock native game timing.",margin,note_y,16,col_muted);
-            ui_text(s.mode==2?"Keyboard in game: Space/Z A, X B, C X, V Y, Enter Start, arrows D-pad, WASD stick, Q/E triggers.":
-                    TextFormat("%zu real pad(s) mapped. Empty device means automatic.",real_pads.size()),
+            ui_text("Limits presentation only; 120 FPS does not unlock native game timing.",
+                    margin,note_y,16,col_muted);
+            ui_text(gs.mode==2?"Keyboard in game: Space/Z A, X B, C X, V Y, Enter Start, arrows D-pad, WASD stick, Q/E triggers."
+                              :std::to_string(real_pads.size())+" real pad(s) mapped. Empty device means automatic.",
                     margin,note_y+26,16,col_muted);
 
-            // Recomp details for the selected game, right of the rows.
-            const int det_x=margin+(int)kRowW+120;
-            const float det_w=(float)(w-margin-det_x);
+            // A short heading on the right tells the user these are shared
+            // - the rows themselves are value cyclers, nothing more.
+            const int head_x=margin+(int)kRowW+120;
+            ui_text("GLOBAL SETTINGS",head_x,list_y,17,col_teal);
+            ui_text("One launcher.conf is shared by every game in the rail.",
+                    head_x,list_y+24,14,col_muted);
+            ui_text("Pad, FPS cap and renderer choices persist for whichever game you pick next.",
+                    head_x,list_y+44,14,col_muted);
+
+            ui_text(status,margin,h-72,18,status_err?col_err:col_ok);
+            ui_text("Left/Right change   A select   B back",margin,h-28,15,col_hint);
+        }else if(st.screen==Screen::About){
+            // Full-width left margin layout: header strip, then a single
+            // column of labelled detail lines.
+            ui_text("ABOUT",margin,margin,36,RAYWHITE);
             const fs::path root=home/g.dir;
             std::error_code ec;
-            int dy=list_y;
-            ui_text("RECOMP DETAILS",det_x,dy,17,col_teal);dy+=30;
-            ui_text(g.title,det_x,dy,20,RAYWHITE);dy+=26;
-            ui_text(g.tag,det_x,dy,16,col_muted);dy+=28;
-            ui_text("100% NATIVE",det_x,dy,15,col_ok);dy+=22;
-            ui_text(g.how1,det_x,dy,15,col_muted);dy+=21;
-            ui_text(g.how2,det_x,dy,15,col_muted);dy+=30;
+            int dy=margin+84;
+            if(tiles[st.selected].ok()){
+                const auto t=tiles[st.selected].tex();
+                DrawTexturePro(t,{0,0,(float)t.width,(float)t.height},
+                               {(float)margin,(float)dy,80,80},{0,0},0,WHITE);
+            }
+            const int text_x=margin+(tiles[st.selected].ok()?98:0);
+            ui_text(g.title,text_x,dy,28,RAYWHITE);dy+=34;
+            ui_text(g.tag,text_x,dy,16,col_muted);dy+=30;
+            ui_text("100% NATIVE",text_x,dy,15,col_ok);dy+=22;
+            ui_text(g.how1,text_x,dy,15,col_muted);dy+=21;
+            ui_text(g.how2,text_x,dy,15,col_muted);dy+=36;
+            const float det_w=(float)(w-margin-text_x);
             auto detail=[&](const std::string &label,const std::string &value,Color c){
-                ui_text(label,det_x,dy,15,col_muted);
+                ui_text(label,text_x,dy,15,col_muted);
                 ui_text(fit_left(value,15,det_w-ui_measure(label,15)-10),
-                        det_x+(int)ui_measure(label,15)+10,dy,15,c);
+                        text_x+(int)ui_measure(label,15)+10,dy,15,c);
                 dy+=24;
             };
             detail("Game dir:",root.string(),col_muted);
             detail("Host binary:",std::string(g.host)+(fs::exists(root/g.host,ec)?" (found)":" (missing)"),
                    fs::exists(root/g.host)?col_ok:col_err);
-            detail("Disc image:",fs::exists(root/"disc/1ST_READ.BIN",ec)?"disc/1ST_READ.BIN (found)":"disc/1ST_READ.BIN (missing)",
-                   fs::exists(root/"disc/1ST_READ.BIN")?col_ok:col_warn);
-            detail("Renderer:",s.renderer?"SDL3 / Vulkan":"raylib / OpenGL",col_muted);
-            detail("Config:",(cfg/(std::string(g.id)+".conf")).string(),col_muted);
+            detail("Disc image:",has_content(g)?"disc/1ST_READ.BIN + gdmap.txt (found)":"disc/1ST_READ.BIN (missing)",
+                   has_content(g)?col_ok:col_warn);
+            detail("Renderer:",gs.renderer?"SDL3 / Vulkan":"raylib / OpenGL",col_muted);
             const std::string log=latest_log(data,g.id);
             detail("Latest log:",log.empty()?"none yet":log,col_muted);
 
             ui_text(status,margin,h-72,18,status_err?col_err:col_ok);
-            ui_text("Left/Right change   A select   B back",margin,h-28,15,col_hint);
+            ui_text("B back   LB/RB game",margin,h-28,15,col_hint);
         }
 
         // Clear-data confirmation, over everything.
-        if(confirming_clear){
-            const Game &cg=games[clear_game];
+        if(st.confirming_clear){
+            const Game &cg=games[st.clear_game];
             DrawRectangle(0,0,w,h,Color{0,0,0,220});
             ui_text("Clear the imported data for "+std::string(cg.title)+"?",margin,h/2-50,28,RAYWHITE);
             ui_text("Removes everything in "+(home/cg.dir/"disc").string(),margin,h/2-6,17,col_muted);
