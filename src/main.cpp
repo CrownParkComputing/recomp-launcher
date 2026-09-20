@@ -580,6 +580,11 @@ int main(int argc,char **argv){
         return fs::exists(root/"disc/1ST_READ.BIN",ec)
             && fs::exists(root/"disc/gdmap.txt",ec);
     };
+    auto has_host=[&](const Game &g){
+        std::error_code ec;
+        const fs::path root=home/g.dir;
+        return fs::exists(root/g.host,ec);
+    };
     auto try_play=[&]{
         Game &g=games[st.selected];
         if(any_running()){
@@ -588,6 +593,11 @@ int main(int argc,char **argv){
         }
         if(!has_content(g)){
             set_status(std::string(g.title)+" has no game content yet - import a .gdi first (Game files).",true);
+            return;
+        }
+        if(!has_host(g)){
+            set_status(std::string(g.title)+" recomp is not built - "+std::string(g.host)+
+                       " is missing under "+std::string(g.dir)+"/.",true);
             return;
         }
         try{
@@ -790,17 +800,20 @@ int main(int argc,char **argv){
 
             // Actions under the rail.
             const bool content=has_content(g);
+            const bool built=has_host(g);
             const int item_h=48;
             const int list_y=(int)rail_y+188;
             for(int i=0;i<kHomeCount;++i){
                 const Rectangle row{(float)margin,(float)(list_y+i*item_h),420.0f,(float)(item_h-10)};
                 const bool sel=i==st.home_sel;
                 const bool running=any_running();
-                const bool dim=(i==0&&(running||!content));
+                const bool dim=(i==0)&&(running||!content||!built);
                 std::string label=kHomeItems[i];
                 if(i==0)label=running?"RUNNING - close the game to return"
-                                 :(content?"Play":"Play (import a .gdi first - Game files)");
-                else if(i==1)label=content?"Game files (content imported)":"Game files (no content)";
+                                 :(!content?"Play (import a .gdi first - Game files)"
+                                  :(!built?"Play (recomp not built)":"Play"));
+                else if(i==1)label=content?(built?"Game files (ready)":"Game files (content imported, recomp not built)")
+                                            :"Game files (no content)";
                 if(row_draw(row,label,sel,dim)){
                     if(i==0)try_play();
                     else if(i==1){st.screen=Screen::Files;st.files_sel=0;}
@@ -819,8 +832,13 @@ int main(int argc,char **argv){
             }
             ui_text(g.title,info_x+(tiles[st.selected].ok()?82:0),list_y,28,RAYWHITE);
             ui_text(g.tag,info_x+(tiles[st.selected].ok()?82:0),list_y+37,17,col_muted);
-            ui_text(g.pid?"Running now":(content?"Ready to play":"No game data imported - import a .gdi in Game files"),
-                    info_x,list_y+84,18,g.pid?col_ok:(content?col_warn:col_err));
+            std::string status_text;
+            Color status_col;
+            if(g.pid){status_text="Running now";status_col=col_ok;}
+            else if(!content){status_text="No game data imported - import a .gdi in Game files";status_col=col_err;}
+            else if(!built){status_text="Recomp not built - "+std::string(g.host)+" missing";status_col=col_warn;}
+            else{status_text="Ready to play";status_col=col_ok;}
+            ui_text(status_text,info_x,list_y+84,18,status_col);
             ui_text("FPS cap: "+std::to_string(gs.fps)+"   overlay: "+(gs.show?"on":"off")+
                     "   renderer: "+(gs.renderer?"Vulkan":"OpenGL"),
                     info_x,list_y+116,16,col_muted);
