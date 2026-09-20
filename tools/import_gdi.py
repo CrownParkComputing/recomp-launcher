@@ -407,23 +407,152 @@ def extract(gdi_path, dest, track_number=None, list_only=False, progress=True):
                 pass
 
 
+def read_ipbin(gdi_path, tracks, zf):
+    """Return the first sector of track01.bin, the low-density GD-ROM
+    lead-in. The IP.BIN there carries the game title (offset 0x80) and
+    product code (offset 0x50). Used by auto-detect.
+    """
+    track1 = next((t for t in tracks if t.number == 1), None)
+    if track1 is None:
+        raise GdiError("no track 01 in the manifest - cannot read IP.BIN")
+    if zf is not None:
+        member = zip_member_for(zf, track1.filename)
+        with zf.open(member) as src:
+            return src.read(RAW_SECTOR if track1.sector_size == RAW_SECTOR
+                            else track1.sector_size)
+    p = os.path.join(os.path.dirname(os.path.abspath(gdi_path)) or ".", track1.filename)
+    if not os.path.isfile(p):
+        raise GdiError("track 1 file not found: " + p)
+    with open(p, "rb") as f:
+        n = track1.sector_size if track1.sector_size in (RAW_SECTOR, COOKED_SECTOR) else RAW_SECTOR
+        return f.read(n)
+
+
+def read_title(ipbin):
+    """Extract the game title string from an IP.BIN sector. The title
+    starts at offset 0x80 and runs to the next NUL; we trim to the first
+    non-space word boundary so the matcher compares just the title."""
+    if len(ipbin) < 0x100:
+        return ""
+    chunk = ipbin[0x80:0x180]
+    nul = chunk.find(b"\x00")
+    if nul >= 0:
+        chunk = chunk[:nul]
+    return chunk.decode("ascii", errors="replace").strip().upper()
+
+
+# Order matters: Power Stone 2 must beat Power Stone 1 because its title
+# is a superset; the matcher takes the first candidate whose label appears
+# in the IP.BIN title, so the more specific entry has to be checked first.
+DEFAULT_CANDIDATES = [
+    ("powerstone2", "POWER STONE 2"),
+    ("powerstone2", "POWER STONE II"),
+    ("powerstone",  "POWER STONE"),
+    ("msr",          "METROPOLIS STREET RACER"),
+    ("hydrothunder", "HYDRO THUNDER"),
+]
+
+
+def detect_game(title, candidates=None):
+    """Return the first candidate label whose substring appears in title,
+    or None. The launcher passes its own candidates; the defaults are
+    kept for ad-hoc command-line use."""
+    if not title:
+        return None
+    cand = candidates if candidates is not None else DEFAULT_CANDIDATES
+    for label, needle in cand:
+        if needle in title:
+            return label
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Extract the game filesystem "
                                      "from a Dreamcast .gdi dump.")
     ap.add_argument("gdi", help="path to the .gdi manifest")
-    ap.add_argument("dest", help="directory to extract into (the game's "
-                    "disc/ folder)")
+    ap.add_argument("dest", nargs="?", default=None,
+                    help="directory to extract into (the game's disc/ "
+                    "folder). Not required for --detect.")
     ap.add_argument("--track", type=int, default=None,
                     help="data track number (default: first high-density "
                     "data track)")
     ap.add_argument("--list", action="store_true",
                     help="list the filesystem without extracting")
+    ap.add_argument("--detect", action="store_true",
+                    help="read the IP.BIN, print the detected game title "
+                    "and a guessed game id, then exit")
+    ap.add_argument("--candidate", action="append", default=[],
+                    metavar="id:SUBSTRING",
+                    help="add a (game_id, title substring) candidate for "
+                    "--detect. Most specific first; first match wins.")
+    ap.add_argument("--target", action="append", default=[],
+                    metavar="id:DEST",
+                    help="add a (game_id, destination directory) pair for "
+                    "--auto. The matched game's directory is used.")
+    ap.add_argument("--auto", action="store_true",
+                    help="detect the game from IP.BIN, then extract into "
+                    "the matching --target directory")
     args = ap.parse_args(argv)
+    if args.detect or args.auto:
+        try:
+            tracks, zf = parse_gdi(args.gdi)
+        except GdiError as e:
+            print("import-gdi: %s" % e, file=sys.stderr)
+            return 2
+        try:
+            ipbin = read_ipbin(args.gdi, tracks, zf)
+        except GdiError as e:
+            print("import-gdi: %s" % e, file=sys.stderr)
+            return 2
+        title = read_title(ipbin)
+        cand = [tuple(c.split(":", 1)) for c in args.candidate if ":" in c]
+        if not cand:
+            cand = DEFAULT_CANDIDATES
+        match = detect_game(title, cand)
+        print("title: %s" % title)
+        print("detected: %s" % (match if match else "unknown"))
+        if not args.auto:
+            return 0 if match else 4
+        if not match:
+            if zf is not None:
+                zf.close()
+            return 4
+        targets = {}
+        for t in args.target:
+            if ":" in t:
+                k, _, v = t.partition(":")
+                targets[k] = v
+        if match not in targets:
+            print("import-gdi: detected %r but no --target for that id"
+                  % match, file=sys.stderr)
+            if zf is not None:
+                zf.close()
+            return 4
+        dest = targets[match]
+        try:
+            if os.path.islink(dest):
+                raise GdiError("destination is a symbolic link: " + dest)
+            os.makedirs(dest, exist_ok=True)
+            extract(args.gdi, dest, args.track, args.list)
+        except GdiError as e:
+            print("import-gdi: %s" % e, file=sys.stderr)
+            if zf is not None:
+                zf.close()
+            return 2
+        except OSError as e:
+            print("import-gdi: %s" % e, file=sys.stderr)
+            if zf is not None:
+                zf.close()
+            return 3
+        if zf is not None:
+            zf.close()
+        return 0
+    if not args.dest:
+        ap.error("dest is required unless --detect or --auto is set")
     try:
-        if not args.list:
-            if os.path.islink(args.dest):
-                raise GdiError("destination is a symbolic link: " + args.dest)
-            os.makedirs(args.dest, exist_ok=True)
+        if os.path.islink(args.dest):
+            raise GdiError("destination is a symbolic link: " + args.dest)
+        os.makedirs(args.dest, exist_ok=True)
         extract(args.gdi, args.dest, args.track, args.list)
     except GdiError as e:
         print("import-gdi: %s" % e, file=sys.stderr)

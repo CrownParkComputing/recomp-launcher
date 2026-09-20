@@ -285,20 +285,23 @@ struct State {
     Screen screen=Screen::Home;
     Nav nav{};
     int home_sel=0, settings_sel=0, files_sel=0;
-    int files_game=0; // which game the Files-screen actions target
+    int files_game=0; // which game Clear operates on in the Files screen
     // Rail hover state, one frame stale by design (see the draw below).
     int rail_hover=-1;
     float rail_scroll_x=0.0f;
     bool rail_scroll_ready=false;
     // GDI import: one async zenity .gdi picker at a time (single-file
-    // selection), then a forked tools/import_gdi.py child PER GAME. The
-    // Game files screen lets you queue imports for several games while
-    // earlier ones are still on disk.
+    // selection); the importer reads IP.BIN to detect which game the dump
+    // is for and extracts straight to that game's disc/. Multiple import
+    // children can run in parallel so the user can queue several dumps.
     pid_t gdi_pid=0;
-    int gdi_fd=-1, gdi_game=0;
+    int gdi_fd=-1;
     std::string gdi_text;
     std::vector<pid_t> import_pid;
-    std::vector<std::string> import_log;
+    std::string import_log_path;
+    // Last detected game id (set when import child reports one); used to
+    // surface the per-import status message after the child reaps.
+    std::string last_detected;
     bool confirming_clear=false;
     int clear_game=0;
 };
@@ -403,8 +406,6 @@ int main(int argc,char **argv){
     }
 
     State st;
-    st.import_pid.assign(games.size(),(pid_t)0);
-    st.import_log.assign(games.size(),std::string{});
     const char *const kHomeItems[]={"Play","Game files","Settings","About","Quit"};
     const int kHomeCount=5;
     const char *const kSettingsItems[]={"Frame-rate limit","FPS overlay","Renderer",
@@ -413,10 +414,11 @@ int main(int argc,char **argv){
     const int kSettingsCount=8;
     const float kRowW=560.0f;   // settings rows; the GLOBAL heading sits right of them
 
-    // Fork tools/import_gdi.py for game gi on the picked .gdi path; output
-    // goes to a per-import log so a failure is diagnosable after the fact.
-    auto start_import=[&](int gi,const std::string &gdi_path){
-        const Game &ig=games[gi];
+    // Fork tools/import_gdi.py in --auto mode: the script reads IP.BIN from
+    // the GDI's track 01, picks the matching game from our candidates, and
+    // extracts into that game's disc/. We don't know which game is which
+    // here - the importer figures it out from the disc itself.
+    auto start_import=[&](const std::string &gdi_path){
         std::error_code ec;
         const fs::path self=fs::canonical("/proc/self/exe",ec);
         fs::path tool;
@@ -425,18 +427,61 @@ int main(int argc,char **argv){
         else tool=home/"recomp-launcher/tools/import_gdi.py";
         if(!fs::exists(tool))throw std::runtime_error("Import tool not found: "+tool.string());
         fs::create_directories(data/"logs");
-        st.import_log[gi]=(data/"logs"/(std::string(ig.id)+"-import-"+std::to_string(time(nullptr))+".log")).string();
-        int fd=open(st.import_log[gi].c_str(),O_WRONLY|O_CREAT|O_APPEND,0600);
+        st.import_log_path=(data/"logs"/("import-"+std::to_string(time(nullptr))+".log")).string();
+        int fd=open(st.import_log_path.c_str(),O_WRONLY|O_CREAT|O_APPEND,0600);
         if(fd<0)throw std::runtime_error("Cannot create import log");
         pid_t pid=fork();
         if(pid==0){
             dup2(fd,STDOUT_FILENO);dup2(fd,STDERR_FILENO);close(fd);
-            const std::string dest=(home/ig.dir/"disc").string();
-            execlp("python3","python3",tool.c_str(),gdi_path.c_str(),dest.c_str(),(char*)nullptr);
+            // Build --target id:dir and --candidate id:title pairs. Order:
+            // most specific title first (Power Stone 2 beats Power Stone).
+            std::vector<std::string> args={"python3",tool.c_str(),
+                "--auto",gdi_path.c_str()};
+            static const struct{const char *id;const char *title;} cands[]={
+                {"powerstone2","POWER STONE 2"},
+                {"powerstone2","POWER STONE II"},
+                {"powerstone","POWER STONE"},
+                {"msr","METROPOLIS STREET RACER"},
+                {"hydrothunder","HYDRO THUNDER"},
+            };
+            for(const auto &c:cands){
+                args.push_back("--candidate");
+                args.push_back(std::string(c.id)+":"+c.title);
+            }
+            for(const auto &gg:games){
+                args.push_back("--target");
+                args.push_back(std::string(gg.id)+":"+(home/gg.dir/"disc").string());
+            }
+            std::vector<char *> argv;
+            argv.reserve(args.size());
+            for(auto &s:args)argv.push_back(s.data());
+            argv.push_back(nullptr);
+            execvp("python3",argv.data());
             perror("exec import");_exit(127);
         }
         close(fd);if(pid<0)throw std::runtime_error("Cannot start import");
-        st.import_pid[gi]=pid;
+        st.import_pid.push_back(pid);
+    };
+    // Single picker for the whole Files screen: pick a .gdi dump (or zip
+    // holding one), the importer detects which game it is. No per-game
+    // picker needed - Files → Import just opens zenity once.
+    auto start_picker=[&]{
+        if(st.gdi_fd>=0||!st.import_pid.empty())return;
+        int pipes[2];
+        if(pipe(pipes)!=0)return;
+        st.gdi_pid=fork();
+        if(st.gdi_pid==0){
+            dup2(pipes[1],STDOUT_FILENO);close(pipes[0]);close(pipes[1]);
+            execlp("zenity","zenity","--file-selection",
+                   "--title=Choose a Dreamcast .gdi dump (or a zip holding one)",
+                   "--file-filter=Dreamcast GDI | *.gdi *.GDI *.zip *.ZIP",(char*)nullptr);
+            _exit(127);
+        }
+        close(pipes[1]);
+        if(st.gdi_pid>0){
+            st.gdi_fd=pipes[0];fcntl(st.gdi_fd,F_SETFL,O_NONBLOCK);
+            st.gdi_text.clear();
+        }else close(pipes[0]);
     };
     // One cycler for the global settings rows, shared by pad, keyboard and
     // mouse. Every mutation auto-saves: leaving the menu with a half-saved
@@ -458,32 +503,10 @@ int main(int argc,char **argv){
             set_status("Settings saved");
         }catch(const std::exception &e){set_status(e.what(),true);}
     };
-    // Files rows: one row per game (status) + 3 action rows that target
-    // files_game (the LB/RB-selected game). Import GDI is non-blocking and
-    // per-game, so the user can pick a .gdi for game A, navigate to game B,
-    // and pick another .gdi while A's import is still on disk.
-    auto start_picker_for=[&](int gi){
-        if(st.gdi_fd>=0)return;
-        const Game &g=games[gi];
-        if(g.pid)return;
-        int pipes[2];
-        if(pipe(pipes)!=0)return;
-        st.gdi_pid=fork();
-        if(st.gdi_pid==0){
-            dup2(pipes[1],STDOUT_FILENO);close(pipes[0]);close(pipes[1]);
-            execlp("zenity","zenity","--file-selection",
-                   "--title=Choose a Dreamcast .gdi dump (or a zip holding one)",
-                   "--file-filter=Dreamcast GDI | *.gdi *.GDI *.zip *.ZIP",(char*)nullptr);
-            _exit(127);
-        }
-        close(pipes[1]);
-        if(st.gdi_pid>0){
-            st.gdi_fd=pipes[0];fcntl(st.gdi_fd,F_SETFL,O_NONBLOCK);
-            st.gdi_text.clear();st.gdi_game=gi;
-        }else close(pipes[0]);
-    };
+    // Clear request for whichever game is highlighted (the Files screen
+    // does the highlighting; this just kicks off the confirm dialog).
     auto request_clear_for=[&](int gi){
-        if(games[gi].pid||st.import_pid[gi]||st.gdi_fd>=0)return;
+        if(games[gi].pid)return;
         st.confirming_clear=true;st.clear_game=gi;
     };
 
@@ -598,25 +621,26 @@ int main(int argc,char **argv){
                     while(!st.gdi_text.empty()&&(st.gdi_text.back()=='\n'||st.gdi_text.back()=='\r'))st.gdi_text.pop_back();
                     if(!st.gdi_text.empty()){
                         try{
-                            start_import(st.gdi_game,st.gdi_text);
-                            set_status("Importing "+std::string(games[st.gdi_game].title)+
-                                       " content from the .gdi - this can take a minute...");
+                            start_import(st.gdi_text);
+                            set_status("Importing "+st.gdi_text+" - the importer reads the disc's IP.BIN and picks the game automatically.");
                         }catch(const std::exception &e){set_status(e.what(),true);}
                     }
                 }
             }
         }
-        // Reap a finished import per game. Multiple imports can run in parallel
-        // (one per game), so we walk all slots each frame.
-        for(int i=0;i<(int)st.import_pid.size();++i){
-            if(!st.import_pid[i])continue;
-            int code;pid_t p=waitpid(st.import_pid[i],&code,WNOHANG);
-            if(p==st.import_pid[i]){
+        // Reap finished imports. Each child prints "detected: <game_id>" to
+        // its stdout; that ends up in import_log_path. The launcher only
+        // cares whether the run succeeded; the user reads the log to find
+        // out which game the dump was assigned to.
+        for(auto it=st.import_pid.begin();it!=st.import_pid.end();){
+            if(!*it){++it;continue;}
+            int code;pid_t p=waitpid(*it,&code,WNOHANG);
+            if(p==*it){
                 const bool ok=WIFEXITED(code)&&WEXITSTATUS(code)==0;
-                st.import_pid[i]=0;
-                set_status(ok?std::string(games[i].title)+" content imported - ready to play."
-                             :"Import failed; see log: "+st.import_log[i],!ok);
-            }
+                it=st.import_pid.erase(it);
+                set_status(ok?"Import finished. See the launcher's status line for the detected game."
+                             :"Import failed; see log: "+st.import_log_path,!ok);
+            }else ++it;
         }
 
         // LB/RB switches the active game from any non-modal screen. The
@@ -670,7 +694,7 @@ int main(int argc,char **argv){
                 if(st.nav.b||st.nav.y)st.confirming_clear=false;
                 else if(st.nav.a){
                     Game &cg=games[st.clear_game];
-                    if(cg.pid||st.import_pid[st.clear_game]){
+                    if(cg.pid||!st.import_pid.empty()){
                         set_status("Cannot clear while the game or an import is running.",true);
                     }else try{
                         const fs::path disc=home/cg.dir/"disc";
@@ -693,7 +717,7 @@ int main(int argc,char **argv){
                 if(st.nav.a){
                     if(st.files_sel<import_row){
                         st.files_game=st.files_sel;st.files_sel=import_row;
-                    }else if(st.files_sel==import_row)start_picker_for(st.files_game);
+                    }else if(st.files_sel==import_row)start_picker();
                     else if(st.files_sel==clear_row)request_clear_for(st.files_game);
                     else if(st.files_sel==back_row)st.screen=Screen::Home;
                 }
@@ -816,23 +840,32 @@ int main(int argc,char **argv){
             const int item_h=44;
             const int list_y=margin+108;
             std::error_code ec;
-            // Per-game status rows first.
-            for(int i=0;i<(int)games.size();++i){
-                const Rectangle row{(float)margin,(float)(list_y+i*item_h),560.0f,(float)(item_h-8)};
-                const bool sel=i==st.files_sel;
-                const Game &gg=games[i];
-                const fs::path disc=home/gg.dir/"disc";
-                const bool has_1st=fs::exists(disc/"1ST_READ.BIN",ec);
-                const bool has_map=fs::exists(disc/"gdmap.txt",ec);
-                const bool imported=has_1st&&has_map;
-                std::string tag=gg.tag;
-                std::string status_text;
-                Color st_col;
-                if(st.import_pid[i]){status_text="Importing...";st_col=col_teal;}
-                else if(imported){status_text="Content imported";st_col=col_ok;}
-                else if(has_1st){status_text="gdmap.txt missing - re-import";st_col=col_warn;}
-                else if(gg.pid){status_text="Game running";st_col=col_ok;}
-                else {status_text="No content";st_col=col_warn;}
+            // Per-game status rows first. Status is computed from on-disk content
+                // (1ST_READ.BIN + gdmap.txt) and the recomp host binary. A
+                // game with content but no recomp shows "Content imported
+                // (recomp not built)" so the user can tell Play will fail at
+                // a glance, instead of guessing why "Content imported"
+                // wouldn't actually run.
+                for(int i=0;i<(int)games.size();++i){
+                    const Rectangle row{(float)margin,(float)(list_y+i*item_h),560.0f,(float)(item_h-8)};
+                    const bool sel=i==st.files_sel;
+                    const Game &gg=games[i];
+                    const fs::path disc=home/gg.dir/"disc";
+                    const fs::path root=home/gg.dir;
+                    const bool has_1st=fs::exists(disc/"1ST_READ.BIN",ec);
+                    const bool has_map=fs::exists(disc/"gdmap.txt",ec);
+                    const bool imported=has_1st&&has_map;
+                    const bool has_host=fs::exists(root/gg.host,ec);
+                    std::string tag=gg.tag;
+                    std::string status_text;
+                    Color st_col;
+                    if(gg.pid){status_text="Game running";st_col=col_ok;}
+                    else if(!st.import_pid.empty()&&st.import_pid.back()){
+                        status_text="Importing...";st_col=col_teal;
+                    }else if(imported&&has_host){status_text="Ready to play";st_col=col_ok;}
+                    else if(imported){status_text="Content imported (recomp not built)";st_col=col_warn;}
+                    else if(has_1st){status_text="gdmap.txt missing - re-import";st_col=col_warn;}
+                    else {status_text="No content";st_col=col_warn;}
                 DrawRectangleRounded(row,0.18f,8,sel?col_sel:col_panel);
                 if(sel)DrawRectangleRoundedLinesEx(row,0.18f,8,2.0f,col_outline);
                 ui_text(gg.title,(int)row.x+18,(int)row.y+((int)row.height-22)/2,22,RAYWHITE);
@@ -850,18 +883,18 @@ int main(int argc,char **argv){
                 const int row_idx=(int)games.size()+i;
                 const Rectangle row{(float)margin,(float)(action_y+i*item_h),560.0f,(float)(item_h-8)};
                 const bool sel=row_idx==st.files_sel;
-                const bool dim=(i==0)&&(st.gdi_fd>=0)
-                    || (i==1)&&(fg.pid||st.import_pid[st.files_game]||st.gdi_fd>=0);
+                const bool dim=(i==0)&&(st.gdi_fd>=0||!st.import_pid.empty())
+                    || (i==1)&&(fg.pid||st.gdi_fd>=0);
                 if(row_draw(row,kActions[i],sel,dim)){
                     if(!dim){
-                        if(i==0)start_picker_for(st.files_game);
+                        if(i==0)start_picker();
                         else if(i==1)request_clear_for(st.files_game);
                         else st.screen=Screen::Home;
                     }
                 }
                 if(!dim&&hit(row)&&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)){
                     if(st.files_sel==row_idx){
-                        if(i==0)start_picker_for(st.files_game);
+                        if(i==0)start_picker();
                         else if(i==1)request_clear_for(st.files_game);
                         else st.screen=Screen::Home;
                     }else st.files_sel=row_idx;
