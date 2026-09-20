@@ -1,0 +1,8 @@
+# Repo-local artifacts
+/recomp-launcher
+/logs/
+/tests/settings_test
+
+# Cover art is personal/copyrighted - drop your own <game-id>.png here.
+# The launcher falls back to letter tiles without it.
+/assets/*.png
